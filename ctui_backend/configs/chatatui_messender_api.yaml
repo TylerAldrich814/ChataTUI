@@ -1,0 +1,190 @@
+openapi: "3.0.0"
+info:
+  title: "Chatatui Messenger API"
+  version: "0.1.0"
+  description: "API for Chatatui, a Terminal based Chat messaging System"
+paths:
+  /user/{userId}:
+    get:
+      summary: "Retrieve User details by user ID"
+      parameters:
+        - name: "userId"
+          in: "path"
+          required: true
+          schema:
+            type: "string"
+      responses:
+        200:
+          description: "User Details"
+          content:
+            application/json:
+              schema:
+                type: "object"
+                properties:
+                  username:
+                    type: "string"
+                  location:
+                    type: "string"
+                  groups:
+                    type: "array"
+                    items:
+                      type: "string"
+                  company:
+                    type: "string"
+        404:
+          description: "User Not Found."
+        401:
+          description: "Internal Server Error"
+  /chatrooms:
+    get:
+      summary: "List all Chatrooms"
+      responses:
+        200:
+          description: "List of Chatrooms"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Chatroom"
+        500:
+          description: "Internal Server Error."
+  /chatrooms/{chatroomId}:
+    get:
+      summary: "Retrive chatroom details by chatroom ID."
+      parameters:
+        - name: "chatroomId"
+          in: "path"
+          required: true
+          schema:
+            type: "string"
+      responses:
+        200:
+          description: "Chatroom Details"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatroomDetails"
+        400:
+          description: "Chatroom Not Found"
+        500:
+          description: "Internval Server Error"
+  /chatrooms/{chatroomId}/invite:
+    post:
+      summary: "Invite a user to an invite-only chatroom"
+      parameters:
+        - name: "chatroomId"
+          in: "path"
+          required: true
+          schema:
+            type: "string"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatroomInvite"
+      responses:
+        201:
+          description: "Invute sent successfully"
+        400:
+          description: "Bad request. Invalid input"
+        500:
+          description: "Internal Server Error"
+  /chatrooms/{chatroomId}/messages:
+    get:
+      summary: "Retrive all messages from a specfic chatroom."
+      parameters:
+        - name: "chatroomId"
+          in: "path"
+          required: true
+          schema:
+            type: "string"
+        - name: "page"
+          in: "query"
+          required: false
+          schema:
+            type: "integer"
+            default: 1
+        - name: "limit"
+          in: "query"
+          required: false
+          schema:
+            type: "integer"
+            default: 50
+      responses:
+        200:
+          description: "Pages list of messages."
+          content:
+            application/json:
+              schema:
+                type: "object"
+                properties:
+                  messages:
+                    type: "array"
+                    items:
+                      $ref: "#/components/schemas/Message"
+                  nextPage:
+                    type: "integer"
+                  prevPage:
+                    type: "integer"
+        500:
+          description: "Internal server error."
+      security:
+        - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: "http"
+      scheme: "bearer"
+  schemas:
+    Message:
+      type: "object"
+      properties:
+        id:
+          type: "string"
+          description: "Unique identifier for the message."
+        content:
+          type: "string"
+          description: "Content of the message"
+        userId:
+          type: "string"
+          description: "The User sending the message"
+        timestamp:
+          type: "string"
+          format: "date-time"
+          description: "Time the message was sent"
+    Chatroom:
+      type: "object"
+      properties:
+        id:
+          type: "string"
+          description: "Unique identifier for the chatroom"
+        name:
+          type: "string"
+          description: "Name of the chatroom"
+    ChatroomDetails:
+      type: "object"
+      properties:
+        chartoomName:
+          type: "string"
+        allUsers:
+          type: "array"
+          items:
+            type: "string"
+        currentUsersOnline:
+          type: "array"
+          items:
+            type: "string"
+        isInviteOnly:
+          type: "boolean"
+    ChatroomInvite:
+      type: "object"
+      properties:
+        userId:
+          type: "string"
+          description: "User ID of the person being invited"
+        secret:
+          type: "string"
+          description: "Secret Code for joining the chatroom, provided by invited user."
