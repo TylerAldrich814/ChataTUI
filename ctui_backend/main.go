@@ -2,116 +2,46 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
+	// "strings"
 	"sync"
 
-	// api?
+	// JWT Webtokens - OAuth & Bearer security
 	// "github.com/dgrijalva/jwt-go"
 	// "cloud.google.com/go/pubsub"
+	"chatatui_backend/db"
 	"chatatui_backend/ws"
-
+	"chatatui_backend/router"
 	"github.com/gorilla/mux"
 )
 
-const PORT = ":8080"
-var addr = flag.String("addr", PORT, "htto service address")
 var live_chatrooms sync.Map
 
-type User string
-
-type Message struct {
-  creator User
-  content string
+func testData(cache *db.Chatrooms){
+  cache.CreateRoom("LydiaIsCute");
+  cache.CreateRoom("TylerIsAwesome");
+  cache.CreateRoom("ReannaIsBeautiful");
 }
 
-type Chatroom struct {
-  id  int
-  name string
-  url  string
-  users []User
-  messages []Message
-}
-func newChatroom(
-  id       int,
-  name     string,
-  url      string,
-  users    []User,
-  messages []Message,
-) Chatroom {
-  return Chatroom {
-    id,
-    name,
-    url,
-    users,
-    messages,
+var Chatrooms = db.Chatrooms{
+    Rooms: make(map[db.RoomName]db.Chatroom),
   }
-}
-func(cm *Chatroom)room_url() string {
-  return cm.url
-}
-
-func(cm *Chatroom)room_name() string {
-  return cm.name
-}
-
-func(cm *Chatroom)meta(){
-  fmt.Println(" <--------------------->")
-  fmt.Println(" -> ID:    {}", cm.id)
-  fmt.Println(" -> NAME:  {}", cm.name)
-  fmt.Println(" -> URL:   {}", cm.url)
-  if len(cm.users) != 0 {
-    fmt.Print(" -> USERS:")
-    for i, user := range cm.users {
-      if i != 0 && i % 5 == 0{
-        fmt.Println()
-      }
-      fmt.Print(" {},", user)
-    }
-  }
-}
-
-
-func getChatrooms() []Chatroom{
-  chatrooms := []Chatroom{
-    newChatroom(
-      2,
-      "BeaverLovers",
-      "beaverlovers1",
-      make([]User, 0),
-      make([]Message, 1024*64),
-    ),
-    newChatroom(
-      1,
-      "MyNameIsTyler",
-      "mynameistyler2",
-      make([]User, 0),
-      make([]Message, 1024*64),
-    ),
-    newChatroom(
-      3,
-      "LydiaIsACutie",
-      "lydiaisacutire3",
-      make([]User, 0),
-      make([]Message, 1024*64),
-    ),
-  }
-  return chatrooms
-}
 
 func main(){
+  testData(&Chatrooms)
+
   r := mux.NewRouter()
 
   r.HandleFunc("/", homeHandler)
   r.HandleFunc("/chatrooms", listChatroomsHandler)
+  r.HandleFunc("/chatrooms/{room_id}", chatroomMeta)
   r.HandleFunc("/chatrooms/{room_id}/ws", websocketHandler)
 
   log.Println(" --> ChataTUI-Server Started <--")
   http.Handle("/", r)
-  if err := http.ListenAndServe(PORT, nil); err != nil {
+  if err := http.ListenAndServe(router.PORT, nil); err != nil {
     log.Fatalf("ListenAndServe ERROR: %s", err.Error())
   }
 }
@@ -128,12 +58,34 @@ func homeHandler(w http.ResponseWriter, r *http.Request){
   json.NewEncoder(w).Encode(welcome_message)
 }
 
-func listChatroomsHandler(w http.ResponseWriter, r *http.Request){
-  chatrooms := getChatrooms()
-  names := make([]string, len(chatrooms))
+func chatroomMeta(w http.ResponseWriter, r *http.Request) {
+  // chatrooms := getChatrooms()
+  vars := mux.Vars(r)
+  roomName := vars["room_name"]
 
-  for i, room := range chatrooms {
-    names[i] = room.room_name()
+  _, connect := r.URL.Query()["connect"]
+
+  w.Header().Set("Content-Type", "application/json")
+  room, exists := Chatrooms.Rooms[roomName]
+  if !exists {
+    if connect {
+      json.NewEncoder(w).Encode(map[string]bool{"exists": true})
+      return
+    } else {
+      json.NewEncoder(w).Encode(map[string]string{
+        "NULL": fmt.Sprintf("Chatroom \"%s\" doesn't exist.", roomName),
+      })
+      return
+    }
+  }
+  json.NewEncoder(w).Encode(room)
+}
+
+func listChatroomsHandler(w http.ResponseWriter, r *http.Request){
+  names := make([]string, len(Chatrooms.Rooms))
+
+  for name := range Chatrooms.Rooms {
+    names = append(names, name)
   }
   rooms := map[string][]string{
     "rooms": names,
@@ -149,6 +101,15 @@ func websocketHandler(w http.ResponseWriter, r *http.Request){
   roomID := vars["room_id"]
   log.Printf(" -> Room ID: %s\n", roomID)
 
+  // hub, ok := live_chatrooms.Load(roomID)
+  // if !ok {
+  //   response := map[string]string{
+  //     "NotFound": fmt.Sprintf("The Chatroom %s is not created yet, maybe create it?", roomID),
+  //   }
+  //   w.Header().Set("Content-Type", "application/json")
+  //   json.NewEncoder(w).Encode(response)
+  //   return
+  // }
   hub, ok := live_chatrooms.LoadOrStore(roomID, ws.NewHub())
   if !ok {
     go hub.(*ws.Hub).Run()
@@ -156,67 +117,3 @@ func websocketHandler(w http.ResponseWriter, r *http.Request){
 
   ws.ServeWs(hub.(*ws.Hub), w, r)
 }
-
-func mainx(){
-  flag.Parse()
-  fmt.Println("Just a test: ADDR: {}", *addr)
-  //
-
-  chatrooms := getChatrooms()
-  var live_chatrooms sync.Map
-
-  http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-    log.Println(w, " -- ChataTUI-Server --")
-  })
-
-  http.HandleFunc("/chatrooms/", func(w http.ResponseWriter, r *http.Request){
-    roomURL := strings.TrimPrefix(r.URL.Path, "/chatrooms/")
-    if roomURL == "" {
-      log.Print("List of created chatrooms:")
-      for i, room := range chatrooms {
-        if i != 0 && i % 5 == 0 {
-          log.Println()
-        }
-        log.Print(" {}, ", room)
-      }
-      return
-    }
-
-    hub, ok := live_chatrooms.LoadOrStore(roomURL, ws.NewHub())
-    if ok {
-      go hub.(*ws.Hub).Run()
-    }
-
-    fullURL := fmt.Sprintf("/chatrooms/%s/ws", roomURL)
-    http.HandleFunc(fullURL, func(w http.ResponseWriter, r *http.Request) {
-      ws.ServeWs(hub.(*ws.Hub), w, r)
-    })
-  })
-
-  log.Println("Server Started at ", PORT)
-  if err := http.ListenAndServe(PORT, nil); err != nil {
-    log.Fatalf("ListenAndServe ERROR: %s", err.Error())
-  }
-}
-
-// func startChatroom(roomURL string){
-//   hub := ws.NewHub()
-//   go hub.Run()
-//
-//   full_url := fmt.Sprintf("/chatrooms/%s/ws", roomURL)
-//
-//   http.HandleFunc(full_url, func(w http.ResponseWriter, r *http.Request) {
-//     ws.ServeWs(hub, w, r)
-//   })
-//
-//   log.Println(" --> WEBSOCKET IS LIVE <--")
-//
-//   server := &http.Server{
-//     Addr:              PORT,
-//     ReadHeaderTimeout: 3 * time.Second,
-//   }
-//
-//   if err := server.ListenAndServe(); err != nil {
-//     log.Fatal("ListenAndServe: ", err)
-//   }
-// }
