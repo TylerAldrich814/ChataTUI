@@ -54,8 +54,10 @@ type ChatatuiDatabase interface {
   GetUserbyUsername(username string)( *User, error )
   // SaveUsersOnlineStatus :: Changes the Online status of a given user.
   SaveUsersOnlineStatus(username string, isOnline bool) error
+
   // DoesUsernameExist :: Helper function for checking if a Username is takne already.
-  DoesUsernameExist(userID UUID)( bool,error )
+  // DoesUsernameExist(userID UUID)( bool,error )
+
   // SaveUserToken :: Used for both creating and updating a UserToken within the /UserTokens Bucket.
   SaveUserToken(userID UUID, token *token.Token) error
   // GetUserToken :: Helper fucntion for quickly fetching a User's Access Token.
