@@ -14,7 +14,7 @@ const TEMPSECRET = "cbb3589b-8035-4ac2-b978-23dd0d0052b5-4d2f599e-0ff7-476c-a7ed
 // Token: a JWT Token creator struct. For both User credentials
 //        and for Chatroom Membership credentials
 type Token struct {
-  Token string  `json:"token"`
+  Token string  `codec:"token"`
 }
 
 func CreateToken(uid string)( *Token, error ){
@@ -97,10 +97,11 @@ func(userToken *Token)Validate() error {
     return err
   }
 
-  if _, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-    return nil
+  if _, ok := token.Claims.(jwt.MapClaims); !ok && !token.Valid {
+    return fmt.Errorf(" -> Error: Failed to Validate Token")
   }
-  return fmt.Errorf(" -> Error: Failed to Validate Token")
+
+  return nil
 }
 
 func( userToken *Token )TokenIsExpired()( bool,error ){
@@ -117,7 +118,7 @@ func( userToken *Token )TokenIsExpired()( bool,error ){
   return exp.Unix() >= now, nil
 }
 
-func( userToken *Token )GetUserID()( string,error ){
+func( userToken *Token )GetTokenID()( string,error ){
   claims, err := userToken.GetClaims()
   if err != nil {
     return "", err

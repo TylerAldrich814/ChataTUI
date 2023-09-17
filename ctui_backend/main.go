@@ -19,18 +19,47 @@ import (
 
 var live_chatrooms sync.Map
 
-func testData(cache *db.Chatrooms){
-  cache.CreateRoom("LydiaIsCute");
-  cache.CreateRoom("TylerIsAwesome");
-  cache.CreateRoom("ReannaIsBeautiful");
+// func testData(cache *db.Chatrooms){
+//   cache.CreateRoom("LydiaIsCute");
+//   cache.CreateRoom("TylerIsAwesome");
+//   cache.CreateRoom("ReannaIsBeautiful");
+// }
+//
+// var Chatrooms = db.Chatrooms{
+//     Rooms: make(map[db.RoomName]db.Chatroom),
+// }
+
+type Config struct {
+  Port      string
+  DevDBPath string
 }
 
-var Chatrooms = db.Chatrooms{
-    Rooms: make(map[db.RoomName]db.Chatroom),
+func main(){
+  config := Config{
+    Port: ":8080",
+    DevDBPath: "../DevDB",
   }
 
-func main(){
-  testData(&Chatrooms)
+  database, err := db.NewDatabase(config.DevDBPath)
+  if err != nil {
+    log.Fatalf(" -> FATAL: Failed to Create Local Database.")
+    return
+  }
+  defer database.Close()
+
+  wsHub := ws.NewHub()
+  router := router.NewRouter(database, wsHub)
+
+  http.Handle("/", router.SetupRouter())
+
+  log.Printf(" -> Starting Server of PORT %s", config.Port)
+  if err := http.ListenAndServe(config.Port, nil); err != nil {
+    log.Fatalf(" -> ListenAndServe Failed: Error: %s", err.Error())
+  }
+}
+
+func mainvs1(){
+  // testData(&Chatrooms)
 
   r := mux.NewRouter()
 
@@ -101,15 +130,6 @@ func websocketHandler(w http.ResponseWriter, r *http.Request){
   roomID := vars["room_id"]
   log.Printf(" -> Room ID: %s\n", roomID)
 
-  // hub, ok := live_chatrooms.Load(roomID)
-  // if !ok {
-  //   response := map[string]string{
-  //     "NotFound": fmt.Sprintf("The Chatroom %s is not created yet, maybe create it?", roomID),
-  //   }
-  //   w.Header().Set("Content-Type", "application/json")
-  //   json.NewEncoder(w).Encode(response)
-  //   return
-  // }
   hub, ok := live_chatrooms.LoadOrStore(roomID, ws.NewHub())
   if !ok {
     go hub.(*ws.Hub).Run()

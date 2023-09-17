@@ -4,13 +4,13 @@ import (
 	"chatatui_backend/db"
 	"chatatui_backend/token"
 	"chatatui_backend/ws"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
@@ -27,192 +27,200 @@ const (
   PORT = ":8080"
 )
 
-
 type Router struct {
-  // Routes map[RouteURL]func(http.ResponseWriter, *http.Request)
-  DbChatrooms   *db.Chatrooms
-  DbUsers       *db.CtuiUsers
-  // When a user is Logged in, generate a unique UID for that user, and store
-  // UserUID and TokenUID in Tokens as a key/value pair when the user
-  // logs off, remove the key/value pair.
-  // userTokens  map[Token]UserUID
-  userTokens    map[UserUID]Token
-  liveChatrooms sync.Map
+  database db.ChatatuiDatabase
+  wsHub    *ws.Hub
 }
 
-func( router *Router )StartRouter() {
+func NewRouter(database db.ChatatuiDatabase, wsHub *ws.Hub) *Router {
+  router := Router{ database, wsHub }
+
+  return &router
+}
+
+func( router *Router )SetupRouter() *mux.Router {
   r := mux.NewRouter()
 
-  r.HandleFunc("/", router.Home)
-  r.HandleFunc("/User/Signup", router.UserSignup).Methods("POST")
+  r.HandleFunc("/", router.Home).Methods("GET")
   r.HandleFunc("/User/Signin", router.UserSignIn).Methods("POST")
+  r.HandleFunc("/User/Signup", router.UserSignup).Methods("POST")
 
   s := r.PathPrefix("/").Subrouter()
 
   s.Use(router.authenticationHandler)
 
-  // s.HandleFunc("/", http.HandleFunc(router.Home))
+  // s.HandleFunc("/home", router.Home)
   s.HandleFunc("/chatrooms", router.ListPublicChatrooms).Methods("GET");
   s.HandleFunc("/chatrooms/{room_id}", router.GetChatroomMeta).Methods("GET")
   s.HandleFunc("/chatrooms/{room_id}/messages", router.GetChatroomMessages).Methods("GET")
   s.HandleFunc("/chatrooms/{room_id}/join", router.BecomeChatroomMember).Methods("GET")
   s.HandleFunc("/chatrooms/{room_id}/ws", router.JoinChatroom)
-  // s.HandleFunc("/User/{user_id}/SignOut", router.UserSignOut)
-  http.Handle("/", r)
-  if err := http.ListenAndServe(PORT, nil); err != nil {
-    log.Fatalf("FATAL: ListenAndServe Error: %s", err.Error())
-  }
-}
 
+  return r
+}
 // --------------------- Router Helper Funcs ----------------------
 func( router *Router)GetChatroom(roomID string)( *db.Chatroom, error ){
-  room, err := router.DbChatrooms.GetChatroom(roomID)
+  // room, err := router.DbChatrooms.GetChatroom(roomID)
+  room, err := router.database.GetChatroom(roomID)
   if err != nil {
-    log.Printf(" --> ERROR: Failed to retrieve Chatroom \"%s\": %s \n", roomID, err.Error())
-    return nil, err
+    return nil, InvalidChatroomError{ cm: roomID }
   }
-
   return room,nil
 }
-func( router *Router)GetUser(userID string)( *db.User, error ){
-  for uid,user := range router.DbUsers.Users {
-    if uid.String() == userID {
-      return &user, nil
-    }
+func( router *Router)getUser(userID string)( *db.User, error ){
+  uid, err := uuid.Parse(userID)
+  if err != nil {
+    return nil, InvalidUserIDError{ id: userID }
   }
-  log.Printf(" -> GetUser: Failed to find userID \"%s\" \n", userID)
-  return nil, fmt.Errorf("UserID \"%s\" doesn't exist", userID)
+  return router.database.GetUserByID(uid)
 }
-func( router *Router )getToken(userID string)( *token.Token,error ){
-  for uid, token := range router.userTokens {
-    if uid.String() == userID {
-      return &token, nil
-    }
+
+func( router *Router )getToken(r *http.Request)( *token.Token,error ){
+  authHeader := r.Header.Get("Authentication")
+  if authHeader == "" {
+    return nil, MissingAuthHeaderError{ }
   }
-  log.Printf(" -> getToken: Failed to find userID \"%s\" \n", userID)
-  return nil, fmt.Errorf("UserID \"%s\" doesn't exist", userID)
+
+  splitTokens := strings.Split(authHeader, "Bearer ")
+  if len(splitTokens) != 2 {
+    return nil, MalformedTokenError{ }
+  }
+  token := token.Token{ Token: splitTokens[1] }
+  if err := token.Validate(); err != nil {
+    return nil, InvalidTokenError{ }
+  }
+  return  &token, nil
+}
+
+// authenticateToken : Checks the validity of the Authentication Token provided
+//                     by the user. And checks if said token is expired or not.
+func(router *Router)authenticateToken(token *token.Token)( string, error ){
+  userID, err := token.GetTokenID()
+  if err != nil {
+    return "", InvalidTokenIDError{ }
+  }
+  uid, err := uuid.Parse(userID)
+  if err != nil {
+    return "", InvalidTokenError{ }
+  }
+  storedToken, err := router.database.GetUserToken(uid)
+  if err != nil {
+    return "", InvalidTokenIDError{ }
+  }
+  if storedToken.Token != token.Token {
+    return "", TokenNotFoundError{ }
+  }
+
+  expired, _ := token.TokenIsExpired()
+  if expired {
+    return "", TokenIsExpiredError{ }
+  }
+  return userID, nil
 }
 
 // ---------------------- Router HandleFuncs ----------------------
 func( router *Router )authenticationHandler(next http.Handler) http.Handler {
   return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-    authHeader := r.Header.Get("Authorization")
-    if authHeader == "" {
-      http.Error(w, "Authorization header is missing", http.StatusUnauthorized)
-      return
-    }
-
-    splitTokens := strings.Split(authHeader, "Bearer ")
-    if len(splitTokens) != 2 {
-      http.Error(w, "Malformed Token", http.StatusUnauthorized)
-      return
-    }
-
-    token := token.Token{
-      Token: splitTokens[1],
-    }
-
-    // Validate the token
-    if err := token.Validate(); err != nil {
-      http.Error(w, err.Error(), http.StatusUnauthorized)
-      return
-    }
-    serve := false
-    for _, userToken := range router.userTokens {
-      if token == userToken {
-        serve = true
-        break
+    token, err := router.getToken(r)
+    if err != nil {
+      var redirect_error string
+      switch err.(type) {
+      case MissingAuthHeaderError:
+        redirect_error = "missing_auth_header"
+      case MalformedTokenError:
+        redirect_error = "malformed_access_token"
+      case InvalidTokenError:
+        redirect_error = "invalid_access_token"
       }
-    }
 
-    if !serve {
-      http.Error(w, "Invalid Token", http.StatusUnauthorized)
+      http.Redirect(
+        w, r,
+        fmt.Sprintf("/User/Signin?error=%s",redirect_error),
+        http.StatusUnauthorized,
+      )
       return
     }
 
-    next.ServeHTTP(w,r)
+    userID, err := router.authenticateToken(token)
+    if err != nil {
+      var redirect_error string
+      switch err.(type) {
+      case InvalidTokenIDError:
+        redirect_error = ""
+      case InvalidTokenError:
+        redirect_error = ""
+      case TokenNotFoundError:
+        redirect_error = ""
+      case TokenIsExpiredError:
+        redirect_error = ""
+      }
 
-    // Validate the token exists.
-    // if _, ok := router.userTokens[token]; !ok {
-    //   http.Error(w, "Invalid Token", http.StatusUnauthorized)
-    //   return
-    // }
-    // next.ServeHTTP(w,r)
+      http.Redirect(
+        w, r,
+        fmt.Sprintf("/User/Signin?error=%s",redirect_error),
+        http.StatusFound,
+      )
+      return
+    }
+
+    // Store UserID in request context for ease of access later on.
+    ctx := context.WithValue(r.Context(), "userID", userID)
+
+    next.ServeHTTP(w,r.WithContext(ctx))
   })
 }
 
 // Home Route("/") :: This Route will let a User know 3 things.
 //  A.) If they're authorizaed, which will tell the front end to load the Authenticated
 //      home Menu(The rest of the app will Also need to pass Authentication)
-//  b.) If they're Not Authorized. Which will tell the Front-end to load the Sign in/up menu.
+//  b.) If they're Not Authorized, We will tell the Front-end to load the Sign in/up menu.
 //  c.) If they're Authenticated, BUT their token has expired. Loads the Sing-in Screen.
 func( router *Router )Home(
-  w http.ResponseWriter,r *http.Request,
+  w http.ResponseWriter,
+  r *http.Request,
 ){
   // Let the User either Singup or Signup by selecting the correct Option.
   w.Header().Set("Content-Type", "application/json")
-  authHeader := r.Header.Get("Authorization")
-  if authHeader != "" {
-    splitTokens := strings.Split(authHeader, "Bearer ")
-    if len(splitTokens) == 2 {
-      token := splitTokens[1]
 
-      userToken := Token {
-        Token: token,
-      }
-
-      // Validate User Token
-      if err := userToken.Validate(); err != nil {
-        log.Printf(" -> Error: Home: Failed to Validate Token")
-        json.NewEncoder(w).Encode(map[string]bool{
-          "Authed":false,
-        })
-        return
-      }
-
-      exists := false
-      for _, token := range router.userTokens {
-        if token == userToken {
-          exists = true
-          break
-        }
-      }
-
-      if !exists {
-        http.Error(w, "Token validated, but doesn't exist in Databse. User needs to sign in manually", http.StatusBadRequest)
-        json.NewEncoder(w).Encode(map[string]bool{
-          "Authed": false,
-          "Expired": true,
-        })
-      }
-
-      expired, err := userToken.TokenIsExpired()
-      if err != nil {
-        log.Printf(" -> Error: Failed to detect if Token is expired")
-        json.NewEncoder(w).Encode(map[string]bool{
-          "Authed": false,
-        })
-        return
-      }
-      if expired {
-        json.NewEncoder(w).Encode(map[string]bool{
-          "Authed": false,
-          "Expired": true,
-        })
-      }
-
-      json.NewEncoder(w).Encode(map[string]bool{
-        "Authed": true,
-        "Expired": false,
-      })
-      return
-    }
+  token, err := router.getToken(r)
+  if err != nil {
+    http.Redirect(
+      w, r,
+      "/Users/Signup?warn=No_auth_token_detected",
+      http.StatusUnauthorized,
+    )
+    return
   }
-  json.NewEncoder(w).Encode(map[string]bool{
-    "Authed": false,
-  })
+
+  _, err = router.authenticateToken(token)
+  if err != nil {
+    var redirect_error string
+    switch err.(type) {
+    case InvalidTokenIDError:
+      redirect_error = ""
+    case InvalidTokenError:
+      redirect_error = ""
+    case TokenNotFoundError:
+      redirect_error = ""
+    case TokenIsExpiredError:
+      redirect_error = ""
+    }
+
+    http.Redirect(
+      w, r,
+      fmt.Sprintf("/User/Signin?error=%s",redirect_error),
+      http.StatusFound,
+    )
+    return
+  }
+
+  w.WriteHeader(http.StatusOK)
 }
 
+// UserSignIn : Route "/Users/Signin" - Expects to receive a 'username' and 'password'
+//    from the client. Hashes and verifys if the User exists in the database. If OK,
+//    creates a brand new Access Token. Stores it in the Users bucket. Then sends the
+//    new Access Token back to the client.
 func( router *Router )UserSignIn(
   w http.ResponseWriter,
   r *http.Request,
@@ -222,18 +230,18 @@ func( router *Router )UserSignIn(
     Username string `json:"username"`
     Password string `json:"password"`
   }{ }
+
   decoder := json.NewDecoder(r.Body)
   if err := decoder.Decode(&userData); err != nil {
-    http.Error(w, "Invalid Request Payload", http.StatusBadRequest)
+    http.Error(w, "Invalid Request", http.StatusBadRequest)
     return
   }
   defer r.Body.Close()
 
-  var signingUser *db.User
-  for _, user := range router.DbUsers.Users {
-    if userData.Username == user.Username {
-      signingUser = &user
-    }
+  signingUser, err := router.database.GetUserbyUsername(userData.Username)
+  if err != nil {
+    http.Error(w, "Invalid Username", http.StatusUnauthorized)
+    return
   }
 
   if err := bcrypt.CompareHashAndPassword(
@@ -243,9 +251,10 @@ func( router *Router )UserSignIn(
     http.Error(w, "Password is not correct", http.StatusUnauthorized)
     return
   }
-  signingUser.IsOnline = true
+  // signingUser.IsOnline = true
 
-  // User is now Signin in on the Server. We now create a new Token, replace
+
+  // User is now Signed in on the Server. We now create a new Token, replace
   // the old tooken in our DB and send the new Token to the user to be stored
   // client-side
   userID := signingUser.UserID
@@ -255,7 +264,10 @@ func( router *Router )UserSignIn(
     http.Error(w, "Failed to create new Token", http.StatusInternalServerError)
     return
   }
-  router.userTokens[userID] = *newToken
+  if err := router.database.UpdateUserToken(userID, newToken); err != nil {
+    http.Error(w, "Failed to Store New AccessToken", http.StatusInternalServerError)
+    return
+  }
 
   w.Header().Set("Authorization", "Bearer "+newToken.Token)
   w.WriteHeader(http.StatusCreated)
@@ -281,11 +293,14 @@ func( router *Router )UserSignup(
 
   // Check if UserName is taken yet.
   // NOTE: THis would NOT be sufficient for a very large Userpool
-  for _, user := range router.DbUsers.Users {
-    if user.Username == userSignupData.Username {
-      http.Error(w, "Username already taken", http.StatusConflict)
-      return
-    }
+  exists, err := router.database.DoesUsernameExist(userSignupData.Username)
+  if err != nil {
+    http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+    return
+  }
+  if exists {
+    http.Error(w, "Username already taken", http.StatusBadRequest)
+    return
   }
 
   hashedPassword, err := bcrypt.GenerateFromPassword(
@@ -296,17 +311,27 @@ func( router *Router )UserSignup(
     http.Error(w, "Failed while hashing the password", http.StatusInternalServerError)
     return
   }
-  uid, err := router.DbUsers.OnSignup(userSignupData.Username, hashedPassword)
-  if err != nil {
-    http.Error(w, "Failed to Store new User", http.StatusInternalServerError)
-    return
-  }
+  uid := uuid.New()
 
   userToken, err := token.CreateToken(uid.String())
   if err != nil {
     http.Error(w, "Failed to Create Token", http.StatusInternalServerError)
     return
   }
+
+  user := db.User{
+    UserID: uid,
+    Username: userSignupData.Username,
+    // AccessToken: *userToken,
+    HashedPassword: hashedPassword,
+    // Chatrooms: make(map[db.RoomName]db.MemberType),
+  }
+  err = router.database.SaveUser(user, userToken)
+  if err != nil {
+    http.Error(w, "Failed to store created User in Database", http.StatusInternalServerError)
+    return
+  }
+
 
   w.Header().Set("Authorization", "Bearer "+userToken.Token)
   w.WriteHeader(http.StatusCreated)
@@ -338,17 +363,29 @@ func( router *Router )BecomeChatroomMember(
     return
   }
 
-  userIDQuery := r.URL.Query().Get("user_id")
-  userID, err := uuid.Parse(userIDQuery)
-  if err != nil {
-    return
-  }
+  // userID, ok := r.Context().Value("userID").(uuid.UUID)
+  // if !ok {
+  //   http.Redirect(w,r, "/?error=userID_is_missing", http.StatusUnauthorized)
+  //   return
+  // }
 
-  user, exists := router.DbUsers.Users[userID]
-  if !exists {
-    http.Error(w, "Unknown error occurred while joining chatroom", http.StatusInternalServerError)
+  // userIDQuery := r.URL.Query().Get("user_id")
+  // userID, err := uuid.Parse(userIDQuery)
+  // if err != nil {
+  //   http.Error(w, "userID is invalid", http.StatusBadRequest)
+  //   return
+  // }
+
+  user, err := router.database.GetUserByID(userID)
+  if err != nil {
+    http.Error(w, "Failed to find UserID in Database", http.StatusBadRequest)
     return
   }
+  // user, exists := router.DbUsers.Users[userID]
+  // if !exists {
+  //   http.Error(w, "Unknown error occurred while joining chatroom", http.StatusInternalServerError)
+  //   return
+  // }
 
 
   room, err := router.GetChatroom(roomID)
@@ -417,7 +454,7 @@ func( router *Router )JoinChatroom(
 
   trueChatroomToken := room.Members[userName.Username]
   if chatroomTokenReq != trueChatroomToken.Token {
-    http.Error(w, "Valid token: Doesn't exisst in Chatroom database.", http.StatusUnauthorized)
+    http.Error(w, "Valid token was sent, But doesn't exisst in Chatroom database.", http.StatusUnauthorized)
     return
   }
 

@@ -42,16 +42,18 @@ type Client struct {
 // by executing all reads from this Goroutine.
 func(c *Client)readPump() {
   defer func() {
-		c.hub.unregister <- c
+		c.hub.unregister <-c
     c.conn.Close()
   }()
-  c.conn.SetReadLimit(maxMessageSize)
+
+  c.conn.SetReadLimit(maxMessageSize+64)// Plus Metadata.
   c.conn.SetReadDeadline(time.Now().Add(pongWait))
   c.conn.SetPongHandler(
     func(string) error {
       c.conn.SetReadDeadline(time.Now().Add(pongWait));
       return nil
   })
+
   for {
     _, message, err := c.conn.ReadMessage()
     if err != nil {
@@ -66,6 +68,9 @@ func(c *Client)readPump() {
     }
     fmt.Println(" -> READING MSG")
     message = bytes.TrimSpace(bytes.Replace(message, newLine, space, -1))
+
+    // Add to Database.
+
     c.hub.broadcast <- message
   }
 }
@@ -80,7 +85,7 @@ func(c *Client)writePump() {
   defer func(){
     ticker.Stop()
     c.conn.Close()
-  }()
+}()
   for {
     select {
     case message, ok := <-c.send:
@@ -92,11 +97,14 @@ func(c *Client)writePump() {
       }
       w, err := c.conn.NextWriter(websocket.TextMessage)
       if err != nil {
+        log.Printf(" -> Connection NextWriter Error: %s", err)
         return
       }
-      w.Write(message)
+      // Store on DB
 
+      w.Write(message)
       n := len(c.send)
+
       for i := 0; i < n; i++ {
         w.Write(newLine)
         w.Write(<-c.send)

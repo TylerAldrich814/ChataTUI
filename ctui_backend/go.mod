@@ -9,4 +9,13 @@ require (
 	golang.org/x/crypto v0.13.0
 )
 
-require github.com/golang-jwt/jwt/v5 v5.0.0
+require (
+	github.com/golang-jwt/jwt/v5 v5.0.0
+	go.etcd.io/bbolt v1.3.7
+)
+
+require (
+	github.com/ugorji/go v1.2.11 // indirect
+	github.com/ugorji/go/codec v1.2.11 // indirect
+	golang.org/x/sys v0.12.0 // indirect
+)
