@@ -2,7 +2,6 @@
 name = "chatatui"
 version = "0.1.0"
 edition = "2021"
-# build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,11 +9,23 @@ edition = "2021"
 name = "chatatui"
 path = "./src/main.rs"
 
+[lib]
+name = "chatatui_lib"
+path = "./src/lib.rs"
+
 [dependencies]
-libc = "0.2.147"
-url = "2.4.1"
-tokio = { version = "1.32.0", features = ["full"] }
-tokio-tungstenite = "0.20.0"
+chrono = {version = "0.4.31", features = ["serde"] }
 futures-util = "0.3.28"
+libc = "0.2.147"
+log = { version = "0.4.20", features = [] }
+ratatui = { version = "0.23.0", features = ["all-widgets"]}
 reqwest = { version = "0.11.0", features = ["json"] }
 serde = { version = "1.0.188", features = ["derive"]}
+thiserror = { version = "1.0.48", features = [] }
+tokio = { version = "1.32.0", features = ["full"] }
+tokio-tungstenite = "0.20.0"
+url = "2.4.1"
+uuid = { version = "1.4.1", features = ["serde", "v4"] }
+serde_json = "1.0.106"
+crossterm = { version = "0.27.0", features = ["event-stream"] }
+itertools = "0.11.0"

@@ -3,19 +3,9 @@ package db
 import "fmt"
 
 // ----------------------- Database Errors --------------------------
-
 type BucketNotFoundError struct{ d string }
 func(e BucketNotFoundError)Error() string {
   return fmt.Sprintf("Error: DatabaseError - Bucket \"%s\" not found:  ", e.d)
-}
-
-// DataNotFoundError: d: string = DataKey b: string = bucket
-type DataNotFoundError struct{ d, b string }
-func(e DataNotFoundError)Error() string {
-  return fmt.Sprintf(
-    "Error: DatabaseError - Could not fetch \"%s\" from Bucket \"%s\"",
-    e.d, e.b,
-  )
 }
 
 type EncoderError struct { err string }

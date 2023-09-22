@@ -8,12 +8,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"unicode"
+
+	// "log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/ugorji/go/codec"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -27,15 +32,21 @@ const (
   PORT = ":8080"
 )
 
+// type Client struct {
+//   hub      *Hub
+//   conn     *websocket.Conn
+//   messages chan[]byte // For storing the Messages in the Database
+//   send     chan[]byte
+// }
+
 type Router struct {
-  database db.ChatatuiDatabase
-  wsHub    *ws.Hub
+  database      db.ChatatuiDatabase
+  wsHub         *ws.Hub
+  liveChatrooms sync.Map
 }
 
 func NewRouter(database db.ChatatuiDatabase, wsHub *ws.Hub) *Router {
-  router := Router{ database, wsHub }
-
-  return &router
+  return &Router{ database, wsHub, sync.Map{} }
 }
 
 func( router *Router )SetupRouter() *mux.Router {
@@ -51,13 +62,21 @@ func( router *Router )SetupRouter() *mux.Router {
 
   // s.HandleFunc("/home", router.Home)
   s.HandleFunc("/chatrooms", router.ListPublicChatrooms).Methods("GET");
+  s.HandleFunc("/chatrooms", router.SaveChatroom).Methods("POST")
+
   s.HandleFunc("/chatrooms/{room_id}", router.GetChatroomMeta).Methods("GET")
+  s.HandleFunc("/chatrooms/{room_id}", router.SaveChatroom).Methods("PUT")
+  s.HandleFunc("/chatrooms/{room_id}", router.DeleteChatroom).Methods("DELETE")
+
+  s.HandleFunc("/chatrooms/{room_id}/join", router.JoinChatrooom).Methods("GET")
+
   s.HandleFunc("/chatrooms/{room_id}/messages", router.GetChatroomMessages).Methods("GET")
-  s.HandleFunc("/chatrooms/{room_id}/join", router.BecomeChatroomMember).Methods("GET")
-  s.HandleFunc("/chatrooms/{room_id}/ws", router.JoinChatroom)
+  s.HandleFunc("/chatrooms/{room_id}/load", router.OnLoadChatroom).Methods("GET")
+  s.HandleFunc("/chatrooms/{room_id}/ws", router.EnterChatroom).Methods("")
 
   return r
 }
+
 // --------------------- Router Helper Funcs ----------------------
 func( router *Router)GetChatroom(roomID string)( *db.Chatroom, error ){
   // room, err := router.DbChatrooms.GetChatroom(roomID)
@@ -92,6 +111,69 @@ func( router *Router )getToken(r *http.Request)( *token.Token,error ){
   return  &token, nil
 }
 
+// RespondWithDataOrError :: Can be used for a OK Response, which requires
+//    a json object. Or An Error response, which requires a json object. Or,
+//    just simply an HTTP Error response.
+func RespondWithDataOrError(
+  w http.ResponseWriter,
+  r *http.Request,
+  data interface{},
+  err error,
+  status int,
+){
+  if data != nil {
+    w.Header().Set("Content-Type", "application/json")
+    var jsonData []byte
+    enc := codec.NewEncoderBytes(&jsonData, &db.JSONHandle)
+    if encErr := enc.Encode(data); encErr != nil {
+      http.Error(
+        w,
+        fmt.Sprintf("Internal-Error: %s", encErr.Error()),
+        http.StatusInternalServerError,
+      )
+      return
+    }
+
+    w.WriteHeader(status)
+    w.Write(jsonData)
+    return
+  }
+  if err != nil {
+    http.Error(w, err.Error(), status)
+    return
+  }
+  http.Error(w, "Unknown Error", status)
+}
+
+func DecodeBodyOrError(
+  w http.ResponseWriter,
+  r *http.Request,
+  data interface{},
+) error {
+  if data == nil {
+    log.Fatalf(" !FATAL: DecodeBodyOrError: \"data\" should never be nil! Fix this")
+  }
+
+  decoder := codec.NewDecoder(r.Body, &db.JSONHandle)
+  if decoder == nil {
+    http.Error(w, "Internal-Error:", http.StatusInternalServerError)
+    return db.DecoderError{}
+  }
+
+  if err := decoder.Decode(&data); err != nil {
+    return db.DecoderError{}
+  }
+  return nil
+}
+
+func writeJSONError(w http.ResponseWriter, message string, statusCode int){
+  w.WriteHeader(statusCode)
+  errObj := map[string]string{
+    "error": message,
+  }
+  json.NewEncoder(w).Encode(errObj)
+}
+
 // authenticateToken : Checks the validity of the Authentication Token provided
 //                     by the user. And checks if said token is expired or not.
 func(router *Router)authenticateToken(token *token.Token)( string, error ){
@@ -116,6 +198,31 @@ func(router *Router)authenticateToken(token *token.Token)( string, error ){
     return "", TokenIsExpiredError{ }
   }
   return userID, nil
+}
+
+func extractUserIDfromContext(r *http.Request) uuid.UUID {
+  ctxUserID := r.Context().Value("userID")
+  userID, ok := ctxUserID.(string)
+  if !ok {
+    log.Printf("Failed to retreive UserID from Context")
+    return uuid.Nil
+  }
+  userUID, err := uuid.Parse(userID)
+  if err != nil {
+    log.Printf("Invalid UserID")
+    return uuid.Nil
+  }
+
+  return userUID
+}
+
+func(router *Router)validateRoomMemeber(roomName string, userID uuid.UUID) bool {
+  member, err := router.database.GetChatroomMemberStatus(roomName, userID)
+  if err != nil {
+    fmt.Printf("Failed to Validate User's Membership status")
+    return false
+  }
+  return *member != db.Blocked
 }
 
 // ---------------------- Router HandleFuncs ----------------------
@@ -180,41 +287,46 @@ func( router *Router )Home(
   r *http.Request,
 ){
   // Let the User either Singup or Signup by selecting the correct Option.
-  w.Header().Set("Content-Type", "application/json")
+  resp := struct{
+    Authed bool   `codec:"authed"`
+    Token  string `codec:"token"`
+  }{
+    Authed: false,
+    Token:  "Missing",
+  }
 
   token, err := router.getToken(r)
   if err != nil {
-    http.Redirect(
-      w, r,
-      "/Users/Signup?warn=No_auth_token_detected",
-      http.StatusUnauthorized,
-    )
+    RespondWithDataOrError(w, r, resp, err, http.StatusUnauthorized)
     return
   }
 
   _, err = router.authenticateToken(token)
   if err != nil {
-    var redirect_error string
     switch err.(type) {
     case InvalidTokenIDError:
-      redirect_error = ""
+      resp.Token = "ParseError"
+      RespondWithDataOrError(w, r, resp, nil, http.StatusBadRequest)
+      return
     case InvalidTokenError:
-      redirect_error = ""
+      resp.Token = "Invalid"
+      RespondWithDataOrError(w, r, resp, nil, http.StatusUnauthorized)
+      return
     case TokenNotFoundError:
-      redirect_error = ""
+      resp.Token = "Missing"
+      RespondWithDataOrError(w, r, resp, nil, http.StatusUnauthorized)
+      return
     case TokenIsExpiredError:
-      redirect_error = ""
+      resp.Token = "Expired"
+      RespondWithDataOrError(w, r, resp, nil, http.StatusUnauthorized)
+      return
     }
-
-    http.Redirect(
-      w, r,
-      fmt.Sprintf("/User/Signin?error=%s",redirect_error),
-      http.StatusFound,
-    )
-    return
   }
 
-  w.WriteHeader(http.StatusOK)
+  resp.Authed = true
+  resp.Token = "Valid"
+
+  RespondWithDataOrError(w, r, resp, nil, http.StatusOK)
 }
 
 // UserSignIn : Route "/Users/Signin" - Expects to receive a 'username' and 'password'
@@ -225,17 +337,14 @@ func( router *Router )UserSignIn(
   w http.ResponseWriter,
   r *http.Request,
 ){
-  // Check to see if user submitted a Token within the Auth header
+  w.Header().Set("Content-Type", "application/json")
+
   var userData = struct{
     Username string `json:"username"`
     Password string `json:"password"`
   }{ }
 
-  decoder := json.NewDecoder(r.Body)
-  if err := decoder.Decode(&userData); err != nil {
-    http.Error(w, "Invalid Request", http.StatusBadRequest)
-    return
-  }
+  DecodeBodyOrError(w, r, userData)
   defer r.Body.Close()
 
   signingUser, err := router.database.GetUserbyUsername(userData.Username)
@@ -251,27 +360,36 @@ func( router *Router )UserSignIn(
     http.Error(w, "Password is not correct", http.StatusUnauthorized)
     return
   }
-  // signingUser.IsOnline = true
 
-
-  // User is now Signed in on the Server. We now create a new Token, replace
-  // the old tooken in our DB and send the new Token to the user to be stored
-  // client-side
+  // User is now Verified via username & password
   userID := signingUser.UserID
+
+  if err := router.database.SaveUsersOnlineStatus(signingUser.Username, true); err != nil {
+    http.Error(w, err.Error(), http.StatusInternalServerError)
+    return
+  }
 
   newToken, err := token.CreateToken(userID.String())
   if err != nil {
     http.Error(w, "Failed to create new Token", http.StatusInternalServerError)
     return
   }
-  if err := router.database.UpdateUserToken(userID, newToken); err != nil {
+  if err := router.database.SaveUserToken(userID, newToken); err != nil {
     http.Error(w, "Failed to Store New AccessToken", http.StatusInternalServerError)
     return
   }
 
-  w.Header().Set("Authorization", "Bearer "+newToken.Token)
+  var jsonBytes []byte
+  enc := codec.NewEncoderBytes(&jsonBytes, &db.JSONHandle)
+
+  if err := enc.Encode(newToken); err != nil {
+    http.Error(w, "Failed to Encode Access Token", http.StatusInternalServerError)
+    return
+  }
+
+  // w.Header().Set("Authorization", "Bearer "+newToken.Token)
   w.WriteHeader(http.StatusCreated)
-  w.Write([]byte("User successfully signed in."))
+  w.Write(jsonBytes)
 }
 
 func( router *Router )UserSignup(
@@ -279,6 +397,7 @@ func( router *Router )UserSignup(
   r *http.Request,
 ){
   // w.Header().Set("Authorization", "Bearer "+tokenString)
+  w.Header().Set("Content-Type", "application/json")
   var userSignupData = struct{
     Username  string `json:"username"`
     Password  string `json:"password"`
@@ -291,18 +410,6 @@ func( router *Router )UserSignup(
   }
   defer r.Body.Close()
 
-  // Check if UserName is taken yet.
-  // NOTE: THis would NOT be sufficient for a very large Userpool
-  exists, err := router.database.DoesUsernameExist(userSignupData.Username)
-  if err != nil {
-    http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-    return
-  }
-  if exists {
-    http.Error(w, "Username already taken", http.StatusBadRequest)
-    return
-  }
-
   hashedPassword, err := bcrypt.GenerateFromPassword(
     []byte(userSignupData.Password),
     bcrypt.DefaultCost,
@@ -313,7 +420,7 @@ func( router *Router )UserSignup(
   }
   uid := uuid.New()
 
-  userToken, err := token.CreateToken(uid.String())
+  accessToken, err := token.CreateToken(uid.String())
   if err != nil {
     http.Error(w, "Failed to Create Token", http.StatusInternalServerError)
     return
@@ -322,20 +429,26 @@ func( router *Router )UserSignup(
   user := db.User{
     UserID: uid,
     Username: userSignupData.Username,
-    // AccessToken: *userToken,
     HashedPassword: hashedPassword,
-    // Chatrooms: make(map[db.RoomName]db.MemberType),
   }
-  err = router.database.SaveUser(user, userToken)
+  // Save and Store the User and new Access Token.
+  err = router.database.SaveUser(user, accessToken)
   if err != nil {
     http.Error(w, "Failed to store created User in Database", http.StatusInternalServerError)
     return
   }
 
+  var jsonBytes []byte
+  enc := codec.NewEncoderBytes(&jsonBytes, &db.JSONHandle)
 
-  w.Header().Set("Authorization", "Bearer "+userToken.Token)
+  if err := enc.Encode(accessToken); err != nil {
+    http.Error(w, "Failed to Encode Access Token", http.StatusInternalServerError)
+    return
+  }
+
+  // w.Header().Set("Authorization", "Bearer "+accessToken.Token)
   w.WriteHeader(http.StatusCreated)
-  w.Write([]byte("User successfully Signed up"))
+  w.Write(jsonBytes)
 }
 
 func( router *Router )ListPublicChatrooms(
@@ -345,199 +458,305 @@ func( router *Router )ListPublicChatrooms(
 
 }
 
+func(router *Router)ValidateChatroom(chatroom *db.Chatroom) error {
+  name := chatroom.RoomName
+
+  if len(name) <= 5 || len(name) >= 50{
+    return fmt.Errorf("RoomName must be between 5 and 50 characters")
+  }
+  for _, r := range name {
+    if !unicode.IsLetter(r)  && !unicode.IsNumber(r){
+      return fmt.Errorf(
+        "RoomName can only consist of Letters and Numbers: \"%v\" is not aloud",
+        r,
+      )
+    }
+  }
+  if _, err := router.database.GetUserByID(chatroom.OwnerID); err != nil {
+    return fmt.Errorf("Invalid UserID \"%s\"", chatroom.OwnerID)
+  }
+
+  return nil
+}
+
+// SaveChatroom: Handles both Chatroom Creation and Chatroom Updates.
+func( router *Router )SaveChatroom(
+  w http.ResponseWriter,
+  r *http.Request,
+){
+  var chatroom db.Chatroom
+  dec := codec.NewDecoder(r.Body, &db.JSONHandle)
+  defer r.Body.Close()
+
+
+  if err := dec.Decode(chatroom); err != nil {
+    http.Error(w, "Invalid Chatroom Data", http.StatusBadRequest)
+    return
+  }
+
+  if err := router.ValidateChatroom(&chatroom); err != nil {
+    http.Error(w, err.Error(), http.StatusUnauthorized)
+    return
+  }
+
+  switch r.Method {
+  case http.MethodPost:
+    // Handle Chatroom Creation
+    if err := router.database.SaveChatroom(&chatroom, false); err != nil {
+      http.Error(w, "Failed to save new Chatroom", http.StatusInternalServerError)
+    }
+  case http.MethodPut:
+    // Handle Chatroom Update
+    if err := router.database.SaveChatroom(&chatroom, true); err != nil {
+      http.Error(w, "Failed to update Chatroom", http.StatusInternalServerError)
+    }
+  }
+
+  w.WriteHeader(http.StatusOK)
+}
+
+// GetChatroomMeta :: /chatrooms/room_id
 func( router *Router )GetChatroomMeta(
   w http.ResponseWriter,
   r *http.Request,
 ){
-
-}
-
-func( router *Router )BecomeChatroomMember(
-  w http.ResponseWriter,
-  r *http.Request,
-){
   w.Header().Set("Content-Type", "application/json")
+
   vars := mux.Vars(r)
-  roomID, exists := vars["room_id"]
+  roomName, exists := vars["room_name"]
   if !exists {
+    http.Error(w, "Room name is missing", http.StatusBadRequest)
     return
   }
 
-  // userID, ok := r.Context().Value("userID").(uuid.UUID)
-  // if !ok {
-  //   http.Redirect(w,r, "/?error=userID_is_missing", http.StatusUnauthorized)
-  //   return
-  // }
-
-  // userIDQuery := r.URL.Query().Get("user_id")
-  // userID, err := uuid.Parse(userIDQuery)
-  // if err != nil {
-  //   http.Error(w, "userID is invalid", http.StatusBadRequest)
-  //   return
-  // }
-
-  user, err := router.database.GetUserByID(userID)
+  chatroom, err := router.database.GetChatroom(roomName)
   if err != nil {
-    http.Error(w, "Failed to find UserID in Database", http.StatusBadRequest)
+    var redirectErrorURL string
+    var httpStatus int
+
+    switch err.(type){
+      case db.BucketNotFoundError:
+      case db.DecoderError:
+        redirectErrorURL = "/?error=internal_server_error"
+        httpStatus = http.StatusInternalServerError
+      case db.GetDataError:
+        redirectErrorURL = "/?error=chatroom_doesnt_exist"
+        httpStatus = http.StatusBadRequest
+      default:
+        redirectErrorURL = "/?error=unknown_error"
+        httpStatus = http.StatusInternalServerError
+    }
+
+    http.Redirect(
+      w,r,
+      redirectErrorURL,
+      httpStatus,
+    )
     return
   }
-  // user, exists := router.DbUsers.Users[userID]
-  // if !exists {
-  //   http.Error(w, "Unknown error occurred while joining chatroom", http.StatusInternalServerError)
-  //   return
-  // }
+  var bytes []byte
+  enc := codec.NewEncoderBytes(&bytes, &db.JSONHandle)
 
-
-  room, err := router.GetChatroom(roomID)
-  if err != nil {
-    json.NewEncoder(w).Encode(map[string]string{
-      "ERROR": fmt.Sprintf(
-        "ERROR: Chatroom \"%s\" doesn't exist",
-        roomID,
-      ),
-    })
+  if err := enc.Encode(&chatroom); err != nil {
+    http.Redirect(w,r, "/?error=internal_error", http.StatusInternalServerError)
     return
   }
 
-  // TODO: Handle Private Chatroom Access Logic.
-  //
-  // isPrivate := vars["private"]
-  // ____________________________________________
-
-  token, err := room.AddMember(user.Username)
-  if err != nil {
-    http.Error(w, "Unknown error occurred while creating ChatroomToken", http.StatusInternalServerError)
-    return
-  }
-
-  user.Chatrooms[roomID] = db.Member
-
-  w.Header().Set("Content-Type", "application/json")
-  json.NewEncoder(w).Encode(map[string]string{
-    "CHATROOM_TOKEN": token,
-  })
+  w.WriteHeader(http.StatusOK)
+  w.Write(bytes)
 }
 
-func( router *Router )JoinChatroom(
+// DeleteChatroom :: Deactivates Chatroom. Authentication is based on the Token
+//     provided by the Authentication Bearer Header
+func( router *Router )DeleteChatroom(
+  w http.ResponseWriter,
+  r *http.Request,
+){
+  if r.Method != http.MethodDelete {
+    http.Error(w, "Invalid HTTP Request", http.StatusMethodNotAllowed)
+    return
+  }
+  vars := mux.Vars(r)
+  roomName := vars["room_name"]
+
+  userUID := extractUserIDfromContext(r)
+  if userUID == uuid.Nil {
+    http.Error(w, "Unable to find UserID in Context", http.StatusUnauthorized)
+    return
+  }
+
+  if err := router.database.DeactivateChatroom(roomName, userUID); err != nil {
+    http.Error(w, err.Error(), http.StatusInternalServerError)
+  }
+  w.WriteHeader(http.StatusOK)
+}
+
+// JoinChatrooom :: For becoming a Member of a particular Chatroom
+func( router *Router )JoinChatrooom(
+  w http.ResponseWriter,
+  r *http.Request,
+){
+  w.Header().Set("Content-Type", "application/json")
+  var joinRoomHandle struct {
+    RoomName   string `json:"room_name"`
+    UserName   string `json:"user_name"`
+    Invitation []byte `json:"invitation"`
+  }
+
+  decoder := codec.NewDecoder(r.Body, &db.JSONHandle)
+  if err := decoder.Decode(&joinRoomHandle); err != nil {
+    http.Error(w, "Invalid Join room Handle", http.StatusBadRequest)
+    return
+  }
+  defer r.Body.Close()
+
+  // Calls upon database.EnterChatroom. If Chatroom.Public is set to false. Then
+  // Invitation will be required and will fail if missing/invalid.
+  if err := router.database.JoinChatroom(
+    joinRoomHandle.RoomName,
+    joinRoomHandle.UserName,
+    joinRoomHandle.Invitation,
+  ); err != nil {
+    switch err.(type) {
+    case db.GetDataError:
+      writeJSONError(w, "Malfromed Data Provider", http.StatusBadRequest)
+    case db.FailedSecurityCheckError:
+      writeJSONError(w, "invitation invalid", http.StatusUnauthorized)
+    case db.BucketNotFoundError, db.DecoderError:
+      writeJSONError(w, "internal server error", http.StatusInternalServerError)
+    default:
+      writeJSONError(w, "Unknown Error", http.StatusInternalServerError)
+    }
+    return
+  }
+}
+
+func( router *Router )EnterChatroom(
   w http.ResponseWriter,
   r *http.Request,
 ){
   vars := mux.Vars(r)
-  roomID := vars["room_id"]
+  roomName := vars["room_name"]
 
-  userQuery := r.URL.Query().Get("user_id")
-  userID, err := uuid.Parse(userQuery)
+  userUID := extractUserIDfromContext(r)
+  if userUID == uuid.Nil {
+    http.Error(w, "Unable to find UserID in Context", http.StatusUnauthorized)
+    return
+  }
+
+  // room, exist := router.DbChatrooms.Rooms[roomID];
+  room, err := router.database.GetChatroom(roomName)
   if err != nil {
-    http.Error(w, "Failed to parse userID", http.StatusInternalServerError)
+    http.Redirect(w,r, "/chatrooms?error=invalid_chatroom", http.StatusNotFound)
     return
   }
 
-  userName, exist := router.DbUsers.Users[userID]
-  if !exist {
-    http.Error(w, "Error occurred while trying to find Username", http.StatusInternalServerError)
+  member, err := router.database.GetChatroomMemberStatus(roomName, userUID)
+  if err != nil {
+    switch err.(type){
+    case db.BucketNotFoundError:
+      http.Redirect(w,r, "/chatrooms?error=internal_error", http.StatusInternalServerError)
+    case db.GetDataError:
+      http.Redirect(w,r, "/chatrooms?error=not_a_member", http.StatusUnauthorized)
+    }
     return
   }
 
-  room, exist := router.DbChatrooms.Rooms[roomID];
-  if !exist {
-    http.Error(w, "Chatroom doesn't exist", http.StatusNotFound)
+  if *member == db.Blocked {
+    http.Redirect(w,r, "/chatrooms?error=user_is_blocked", http.StatusUnauthorized)
     return
   }
 
-  chatroomTokenReq := r.Header.Get("X-Chatroom-Token")
-  token := token.Token{ Token: chatroomTokenReq }
+  // Change User's room Status
+  // Find way of detecting if a user's ws connection disconnects ?
 
-  if err = token.Validate(); err != nil {
-    http.Error(w, "Invalid Chatroom Token", http.StatusUnauthorized)
-    return
-  }
-
-  trueChatroomToken := room.Members[userName.Username]
-  if chatroomTokenReq != trueChatroomToken.Token {
-    http.Error(w, "Valid token was sent, But doesn't exisst in Chatroom database.", http.StatusUnauthorized)
-    return
-  }
-
-  //  After Verifying that the User is a Memeber of the chatroom. We can now
-  //  upgrade their connection to a Websocket connection and start
-  //  sending/receiving data
-
-  hub, ok := router.liveChatrooms.LoadOrStore(roomID, ws.NewHub())
+  hub, ok := router.liveChatrooms.LoadOrStore(room.RoomID, ws.NewHub())
+  // If Chatroom is not running. Start an instance in a Goroutine.
   if !ok {
     go hub.(*ws.Hub).Run()
   }
 
-  ws.ServeWs(hub.(*ws.Hub), w, r)
+  // If Chatroom is running, Serve the Websocket instance via hub.
+  ws.ServeWs(hub.(*ws.Hub), router.database, w, r)
 }
 
+func( router *Router)OnLoadChatroom(
+  w http.ResponseWriter,
+  r *http.Request,
+) {
+  w.Header().Set("Content-Type", "application/json")
+
+  vars := mux.Vars(r)
+  defer r.Body.Close()
+
+  userUID := extractUserIDfromContext(r)
+  if userUID == uuid.Nil {
+    http.Error(w, "Unable to find UserID in Context", http.StatusUnauthorized)
+    return
+  }
+  roomName := vars["room_name"]
+
+  if !router.validateRoomMemeber(roomName, userUID) {
+    http.Error(w, "Failed to validate Chatroom Membership", http.StatusUnauthorized)
+    return
+  }
+
+  msgs, err := router.database.Paginate(roomName, 0, db.DefaultPageSize)
+  if err != nil {
+    http.Redirect(w,r, "/chatrooms?error=internal_error", http.StatusInternalServerError)
+    return
+  }
+
+  w.WriteHeader(http.StatusOK)
+  w.Write(msgs)
+}
 
 func( router *Router )GetChatroomMessages(
   w http.ResponseWriter,
   r *http.Request,
-){
-  log.Printf(" -> Chatroom Message Paginate:")
-
+) {
   w.Header().Set("Content-Type", "application/json")
   vars := mux.Vars(r)
-  roomID := vars["room_id"]
+  defer r.Body.Close()
 
-  room, err := router.GetChatroom(roomID)
-  if err != nil {
-    json.NewEncoder(w).Encode(map[string]string{
-      "ERROR": fmt.Sprintf(
-        "ERROR: Chatroom \"%s\" doesn't exist",
-        roomID,
-      ),
-    })
+  roomName := vars["room_name"]
+
+  userUID := extractUserIDfromContext(r)
+  if userUID == uuid.Nil {
+    http.Error(w, "Unable to find UserID in Context", http.StatusUnauthorized)
     return
   }
 
-  // Can't remmeber what this was..
-  // user, err := router.DbUsers
+  if !router.validateRoomMemeber(roomName, userUID) {
+    http.Error(w, "Failed to validate Chatroom Membership", http.StatusUnauthorized)
+    return
+  }
+
+  // TYLER: You were figuring out PAGINATING your messages on EnterChatroom
 
   // Query and Convert any received paginate parameters. If any fail, fall back
   // onto default parameters.
   pageQuery := r.URL.Query().Get("page")
   page, err := strconv.Atoi(pageQuery)
   if err != nil {
-    page = room.CurrentPage
+    // page = 0
+    http.Error(w, "Failed to query page parameter", http.StatusBadRequest)
+    return
   }
   limitQuery := r.URL.Query().Get("limit")
   limit, err := strconv.Atoi(limitQuery)
   if err != nil {
-    limit = db.DefaultPageSize
-  }
-  beforeIDQuery := r.URL.Query().Get("beforeID")
-  beforeID, err := uuid.Parse(beforeIDQuery)
-  if err != nil {
-    beforeID = uuid.Nil
-  }
-  afterIdQuery := r.URL.Query().Get("afterID")
-  afterID, err := uuid.Parse(afterIdQuery)
-  if err != nil {
-    afterID = uuid.Nil
-  }
-
-  log.Printf("       | Page:     %v", page)
-  log.Printf("       | Limit:    %v", limit)
-  log.Printf("       | BeforeID: %s", beforeID)
-  log.Printf("       | AfterID:  %s", afterID)
-
-  messages, err := room.Paginate(
-    page,
-    limit,
-    beforeID,
-    afterID,
-  )
-  if err != nil {
-    log.Printf(" --> ERROR! %s", err.Error())
-    json.NewEncoder(w).Encode(map[string]string{
-      "ERROR": fmt.Sprintf(
-        "ERROR: Failed to Paginate Chatroom Mesages: %s",
-        err.Error(),
-      ),
-    })
+    // limit = db.DefaultPageSize
+    http.Error(w, "Failed to query limit parameter", http.StatusBadGateway)
     return
   }
-  json.NewEncoder(w).Encode(messages)
+
+  // Load and send back Raw Chatroom messages before connecting User to Chatroom WS
+  msgs, err := router.database.Paginate(roomName, page, limit)
+  if err != nil {
+    http.Redirect(w,r, "/chatrooms?error=internal_error", http.StatusInternalServerError)
+    return
+  }
+
+  w.Write(msgs)
 }

@@ -2,6 +2,7 @@ package ws
 
 import (
 	"bytes"
+	"chatatui_backend/db"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,11 +30,12 @@ var upgrader = websocket.Upgrader{
 
 // Client => The middleman between the Websocket connection and the Hub.
 type Client struct {
-  hub *Hub
-  conn *websocket.Conn
-
-  send chan []byte
+  hub      *Hub
+  conn     *websocket.Conn
+  messages chan[]byte // For storing the Messages in the Database
+  send     chan[]byte
 }
+
 
 // readPump pumps messages from the websocket connection to the Hub.
 //
@@ -70,7 +72,7 @@ func(c *Client)readPump() {
     message = bytes.TrimSpace(bytes.Replace(message, newLine, space, -1))
 
     // Add to Database.
-
+    c.messages <- message
     c.hub.broadcast <- message
   }
 }
@@ -122,15 +124,43 @@ func(c *Client)writePump() {
   }
 }
 
+func databaseHandler(c *Client, database db.ChatatuiDatabase) {
+  for msg := range c.messages {
+    // For every new message, save to ChatatuiDatabase/Messages/{msg-id}.
+    // Requires extracting the Chatroom name from the message.
+    if err := database.HandleRawMessage(msg); err != nil {
+      switch err.(type){
+      case db.BucketNotFoundError:
+      case db.DecoderError:
+      case db.EncoderError:
+      case db.PutDataError:
+      }
+    }
+  }
+}
+
 // Handle Websocket requests from the Peer
-func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request){
+func ServeWs(
+  hub *Hub,
+  db db.ChatatuiDatabase,
+  w http.ResponseWriter,
+  r *http.Request,
+){
   conn, err := upgrader.Upgrade(w, r, nil)
   if err != nil {
     log.Println(err)
     return
   }
-  client := &Client{ hub:hub, conn:conn, send:make(chan []byte, 256) }
+  client := &Client{
+    hub:hub,
+    conn:conn,
+    messages: make(chan []byte, 0),
+    send: make(chan []byte, 256),
+  }
   client.hub.register <- client
+
+  // db.MessageChannelHandler(c *ws.Client)
+  go databaseHandler(client, db)
 
   // Allow collection of memory referenced by the caller by doing all work in
   // new Goroutines.

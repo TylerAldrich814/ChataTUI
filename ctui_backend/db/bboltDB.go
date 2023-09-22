@@ -22,10 +22,13 @@ type BBoltDB struct {
 }
 
 func NewDatabase(path string)( *BBoltDB, error ){
+  log.Printf(" -> NewDatabase: Before bbolt.Open(%s, 0600, nil)", path)
   db, err := bbolt.Open(path, 0600, nil)
   if err != nil {
+    log.Printf(" -> NewDatabase: bbol.Open(%s, 0600, nil) FAILURE: %s", path, err.Error())
     return nil, err
   }
+  log.Printf(" -> NewDatabase: After successful bbolt.Open(%s, 0600, nil)", path)
 
   return &BBoltDB{
     db,
@@ -42,7 +45,7 @@ func(db *BBoltDB)GetChatroom(name string)( *Chatroom, error ){
     }
     data := b.Get([]byte(name))
     if data == nil {
-      return DataNotFoundError{name, CHATROOMS}
+      return GetDataError{name, CHATROOMS}
     }
 
     dec := codec.NewDecoderBytes(data, &JSONHandle)
@@ -60,9 +63,11 @@ func(db *BBoltDB)GetChatroom(name string)( *Chatroom, error ){
 // SaveChatroom : Requires a Chatroom Object. Gets/creates the CHATROOMS bucket
 //    Tests to see if the chatroom name is taken yet. Then Creates an entry for the
 //    new chatroom under /Chatrooms/{room_name}.
-//    Used for both Creating and Updating a Chatroom
+//    Used for both Creating and Updating a Chatroom.
+//    an Error will be returned iff update is true, and chatroom doesn't exist.
 func(db *BBoltDB)SaveChatroom(
   chatroom *Chatroom,
+  update   bool,
 ) error {
   return db.db.Update(func(tx *bbolt.Tx) error {
     bucket, err := tx.CreateBucketIfNotExists([]byte(CHATROOMS))
@@ -71,24 +76,96 @@ func(db *BBoltDB)SaveChatroom(
       return BucketNotFoundError{CHATROOMS}
     }
 
-    exist, err := db.DoesChatroomExist(chatroom.RoomName)
-    if err != nil {
-      fmt.Printf(" -> SaveChatroom: Error checking chatroom existince")
-      return err
+
+    if !update {
+      exist, err := db.DoesChatroomExist(chatroom.RoomName)
+      if err != nil {
+        fmt.Printf(" -> SaveChatroom: Error checking if chatroom exists.")
+        return err
+      }
+      if exist {
+        fmt.Printf(" -> SaveChatroom: Chatroom name already taken")
+        return fmt.Errorf("Chatroom name already taken")
+      }
+
+      if err := db.SaveChatroomMember(
+        chatroom.RoomName,
+        chatroom.OwnerID,
+        Owner,
+      ); err != nil {
+        log.Printf(" -> SaveChatroom: Failed to store Chatroom Owner in /ChatroomMembers")
+        return fmt.Errorf("Sever Error: Couldn't Store Chatroom Owner")
+      }
+    } else {
+      status, err := db.GetChatroomMemberStatus(
+        chatroom.RoomName,
+        chatroom.OwnerID,
+      )
+      if err != nil {
+        log.Printf(" -> SaveChatroom: Failed to retreive UserStatus for OwneID in Chatroom")
+        return fmt.Errorf("OwnerID not found in Chatroom Members.")
+      }
+      if *status != Owner || *status != Moderator {
+        log.Printf(" -> SaveChatroom: Invalid Credentials for updating Chatroom")
+        return fmt.Errorf("Invalid Credentials for updating Chatroom")
+      }
     }
-    if exist {
-      fmt.Printf(" -> SaveChatroom: Chatroom name already taken")
-      return fmt.Errorf("Chatroom name already taken")
-    }
+
     var data []byte
     enc := codec.NewEncoderBytes(&data, &JSONHandle)
-    if err := enc.Encode(data); err != nil {
+    if err := enc.Encode(chatroom); err != nil {
       log.Printf(" -> SaveChatroom: Failed to encode Chatroom")
       return EncoderError{err.Error()}
     }
     if err := bucket.Put([]byte(chatroom.RoomName), data); err != nil {
       return PutDataError{chatroom.RoomName, CHATROOMS, err.Error()}
     }
+    return nil
+  })
+}
+
+// DeactivateChatroom: We Deactivate a Chatroom by first testing if the requestee
+//    is the Owner of said chatroom. If so, we simply copy over the Chatroom from
+//    Bucket /Chatrooms -> /InactiveChatrooms. Which isn't accessed from outside
+//    the server.
+func(db *BBoltDB)DeactivateChatroom(roomName string, userID UUID) error {
+  return db.db.Update(func(tx *bbolt.Tx) error {
+    activeBucket := tx.Bucket([]byte(CHATROOMS))
+    if activeBucket == nil {
+      log.Printf(" -> Error: SaveChatroom - Failed to get %s Bucket", CHATROOMS)
+      return BucketNotFoundError{CHATROOMS}
+    }
+    inactiveBucket, err := tx.CreateBucketIfNotExists([]byte(INACTIVECHATROOMS))
+    if err != nil {
+      log.Printf(" -> Error: SaveChatroom - Failed to get %s Bucket: %s", INACTIVECHATROOMS, err)
+      return BucketNotFoundError{CHATROOMS}
+    }
+
+    cm := activeBucket.Get([]byte(roomName))
+    if cm == nil {
+      return fmt.Errorf("Chatroom Doesn't Exist")
+    }
+
+    status, err := db.GetChatroomMemberStatus(roomName, userID)
+    if err != nil {
+      log.Printf(" -> SaveChatroom: Failed to retreive UserStatus for OwneID in Chatroom")
+      return fmt.Errorf("OwnerID not found in Chatroom Members.")
+    }
+    if *status != Owner{
+      log.Printf(" -> SaveChatroom: Invalid Credentials for updating Chatroom")
+      return fmt.Errorf("Invalid Credentials for updating Chatroom")
+    }
+
+    if err := inactiveBucket.Put([]byte(roomName), cm); err != nil {
+      fmt.Printf(" -> DeactivateChatroom: Failed to move Chatroom to /InactiveChatrooms")
+      return PutDataError{roomName, INACTIVECHATROOMS, err.Error()}
+    }
+
+    if err := activeBucket.Delete([]byte(roomName)); err != nil {
+      fmt.Printf(" -> DeactivateChatroom: Failed to Remove Chatroom from /Chatrooms")
+      return DeleteDataError{roomName, CHATROOMS, err.Error()}
+    }
+
     return nil
   })
 }
@@ -117,35 +194,48 @@ func(db *BBoltDB)JoinChatroom(
       return err
     }
 
-    inviteKey := inviteKey(&cr.RoomID, &user.UserID)
-    roomInvitation := invitations.Get([]byte(inviteKey))
-    if roomInvitation == nil {
-      log.Printf(" -> JoinChatroom: Room Invitation doesn't exist")
-      return GetDataError{inviteKey, INVITATIONS}
-    }
-    if err := CompareSecret(invitation, roomInvitation); err != nil {
-      log.Printf(" -> JoinChatroom: Invitation was incorrect.")
-      return FailedSecurityCheckError{"Invitation", err.Error()}
+    if !cr.Public {
+      inviteKey := inviteKey(&cr.RoomID, &user.UserID)
+      roomInvitation := invitations.Get([]byte(inviteKey))
+      if roomInvitation == nil {
+        log.Printf(" -> JoinChatroom: Room Invitation doesn't exist")
+        return GetDataError{inviteKey, INVITATIONS}
+      }
+      if err := CompareSecret(invitation, roomInvitation); err != nil {
+        log.Printf(" -> JoinChatroom: Invitation was incorrect.")
+        return FailedSecurityCheckError{"Invitation", err.Error()}
+      }
+
+      // Invitation not needed anymore. Remove it.
+      if err := db.RemoveInvitation(cr.RoomID, user.UserID); err != nil {
+        return err
+      }
     }
 
-    // Invitation not needed anymore. Remove it.
-    if err := db.RemoveInvitation(cr.RoomID, user.UserID); err != nil {
-      return err
-    }
     // Add User as a Memeber in Chatroom
     return db.SaveChatroomMember(chatroom, user.UserID, Member)
   })
 }
 
-func(db *BBoltDB)DoesChatroomExist(chatroom string)( bool,error ){
+func(db *BBoltDB)DoesChatroomExist(
+  chatroom string,
+)( bool,error ){
   exists := false
   err := db.db.View(func(tx *bbolt.Tx) error {
-    bucket := tx.Bucket([]byte(CHATROOMS))
-    if bucket == nil {
+    active := tx.Bucket([]byte(CHATROOMS))
+    if active == nil {
       log.Printf(" -> DoesChatroomExist: Failed to retreive Bucket \"%s\"", CHATROOMS)
       return BucketNotFoundError{CHATROOMS}
     }
-    if user := bucket.Get([]byte(chatroom)); user != nil {
+    deactive := tx.Bucket([]byte(DEACTIVATEDUSERS))
+    if deactive == nil {
+      log.Printf(" -> DoesChatroomExist: Failed to retreive Bucket \"%s\"", CHATROOMS)
+      return BucketNotFoundError{CHATROOMS}
+    }
+    if cm := active.Get([]byte(chatroom)); cm != nil {
+      exists = true
+    }
+    if cm := deactive.Get([]byte(chatroom)); cm != nil {
       exists = true
     }
     return nil
@@ -222,6 +312,36 @@ func(db *BBoltDB)RemoveInvitation(roomID UUID, userID UUID) error {
   })
 }
 
+func(db *BBoltDB)HandleRawMessage(raw []byte) error{
+  return db.db.Update(func(tx *bbolt.Tx) error {
+    bucket, err := tx.CreateBucketIfNotExists([]byte(MESSAGES))
+    if err != nil {
+      return BucketNotFoundError{MESSAGES}
+    }
+    extraction := struct{
+      Chatroom string  `codec:"chatroom"`
+      Message  Message `codec:"message"`
+    }{}
+    dec := codec.NewDecoderBytes(raw, &JSONHandle)
+    if err := dec.Decode(&extraction); err != nil {
+      return DecoderError{err.Error()}
+    }
+
+    messageKey := extraction.Chatroom + "-" + extraction.Message.TimeStamp.Format(DATEFMT)
+
+    var data[]byte
+    enc := codec.NewEncoderBytes(&data, &JSONHandle)
+    if err := enc.Encode(extraction.Message); err != nil {
+      return EncoderError{err.Error()}
+    }
+    if err := bucket.Put([]byte(messageKey), data); err != nil {
+      return PutDataError{messageKey, MESSAGES, err.Error()}
+    }
+
+    return nil
+  })
+}
+
 // SaveMessage :: Takes and stores a New Message object under /Messages/{chatroom-timestamp}. Might change this later.
 func(db *BBoltDB)SaveMessage(chatroom string, message *Message) error {
   return db.db.Update(func(tx *bbolt.Tx) error {
@@ -259,11 +379,11 @@ func(db *BBoltDB)SaveMessage(chatroom string, message *Message) error {
 func(db *BBoltDB)Paginate(
   chatroomName string,
   page, limit int,
-)( []Message,error ){
+)( []byte, error ){
   if limit <= 0 || page <= 0 {
     return nil, fmt.Errorf("Invalid page or limit value")
   }
-  var messages []Message
+  var rawMessages [][]byte
   err := db.db.View(func(tx *bbolt.Tx) error {
     b := tx.Bucket([]byte(MESSAGES))
     if b == nil {
@@ -283,12 +403,12 @@ func(db *BBoltDB)Paginate(
     }
 
     for i := 0; limiter(i); i++ {
-      var message Message
-      dec := codec.NewDecoderBytes(v, &JSONHandle)
-      if err := dec.Decode(&message); err != nil {
-        return DecoderError{err.Error()}
-      }
-      messages = append(messages, message)
+      // var message Message
+      // dec := codec.NewDecoderBytes(v, &JSONHandle)
+      // if err := dec.Decode(&message); err != nil {
+      //   return DecoderError{err.Error()}
+      // }
+      rawMessages = append(rawMessages, v)
       k, v = c.Next()
     }
     return nil
@@ -296,11 +416,118 @@ func(db *BBoltDB)Paginate(
   if err != nil {
     return nil, err
   }
-  return messages, nil
+  // We'll seperate our Messages with byte("[") & byte("]") for client-side serialzation
+  // I'm not too sure if I want to Ship out messages this way, or by Encoding and Decoding, from
+  // the Database => HTTP.Repsonse body. I'll need to run some benchmarks to see if this is more
+  // Viable.. Maybe I'll abstract the Byte manipulation away, that way I can support more formats
+  // other than just JSON.
+  var combined = []byte("[")
+  for i, msg := range rawMessages {
+    combined = append(combined, msg...)
+    if i != len(rawMessages)-1 {
+      combined = append(combined, ',')
+    }
+  }
+  combined = append(combined, ']')
+
+  return combined, nil
 }
 func computeTimestampForPage(page, limit int) string {
   date := time.Now().AddDate(0, 0, -((page - 1) * limit))
   return date.Format(DATEFMT)
+}
+
+func(db *BBoltDB)UpdateChatroomUserStatus(chatroom, username string, status Status) error {
+  return db.db.Update(func(tx *bbolt.Tx) error {
+    userBucket := tx.Bucket([]byte(USERNAMES))
+    if userBucket == nil {
+      return BucketNotFoundError{USERNAMES}
+    }
+    data := userBucket.Get([]byte(username))
+    if data == nil {
+      return GetDataError{username, USERNAMES}
+    }
+    var user User
+    dec := codec.NewDecoderBytes(data, &JSONHandle)
+    if err := dec.Decode(&user); err != nil {
+      return DecoderError{err.Error()}
+    }
+
+    memtype, err := db.GetChatroomMemberStatus(chatroom, user.UserID)
+    if err != nil || memtype == nil || *memtype == Blocked{
+      return FailedSecurityCheckError{
+        "MemberType: nil or blocked",
+        err.Error(),
+      }
+    }
+
+    liveBucket, err := tx.CreateBucketIfNotExists([]byte(LIVEMEMBER))
+    if err != nil {
+      return BucketNotFoundError{LIVEMEMBER}
+    }
+
+    data = liveBucket.Get([]byte(chatroom))
+
+    users := make(map[UserName]string)
+
+    dec = codec.NewDecoderBytes(data, &JSONHandle)
+    if err := dec.Decode(&users); err != nil {
+      return DecoderError{err.Error()}
+    }
+
+    switch status {
+    case Online:
+      users[username] = "Online"
+    case Background:
+      users[username] = "Background"
+    case Offline:
+      users[username] = "Offline"
+    case Delete:
+      // Should only be called from Owner/Moderator/member(when deleting self)
+      delete(users, username)
+    default:
+      return fmt.Errorf("Unknonw Status Request")
+    }
+
+    var bytes []byte
+    enc := codec.NewEncoderBytes(&bytes, &JSONHandle)
+    if err := enc.Encode(users); err != nil {
+      return EncoderError{err.Error()}
+    }
+
+    if err := liveBucket.Put([]byte(chatroom),bytes); err != nil {
+      return PutDataError{LIVEMEMBER, chatroom, err.Error()}
+    }
+
+    return nil
+  })
+}
+
+func(db *BBoltDB)GetChatroomUserStatus(chatroom string)( map[UserName]string, error ) {
+  var stats = make(map[UserName]string)
+  err := db.db.View(func(tx *bbolt.Tx) error {
+    bucket := tx.Bucket([]byte(LIVEMEMBER))
+    if bucket == nil {
+      return BucketNotFoundError{LIVEMEMBER}
+    }
+
+    data := bucket.Get([]byte(chatroom))
+    if data == nil {
+      return GetDataError{chatroom, LIVEMEMBER}
+    }
+
+    dec := codec.NewDecoderBytes(data, &JSONHandle)
+    if err := dec.Decode(&stats); err != nil {
+      return DecoderError{err.Error()}
+    }
+
+    return nil
+  })
+  if err != nil {
+    return nil, err
+  }
+
+  return stats, nil
 }
 
 // SaveChatroomMember :: For Saving/updating a Chatroom's Member's List.
@@ -404,17 +631,6 @@ func(db *BBoltDB)SaveUser(user User, token *token.Token) error {
         return err
       }
     }
-
-    // // /JoinedChatrooms -> Create an entry under JoinedChatrooms of [userId : db.JoinedChatrooms]
-    // bucket, err = tx.CreateBucketIfNotExists([]byte(JOINEDCHATROOMS))
-    // if err != nil {
-    //   log.Printf(" -> Error: Failed to Create %s Bucket: %s", JOINEDCHATROOMS, err)
-    //   return err
-    // }
-    //
-    // if err := bukcet.Put(user.UserID, JoinedChatroom{
-    //
-    // })
 
     if err := bucket.Put(username, BoolToBytes(true)); err != nil {
       return PutDataError{user.Username, USERNAMES, err.Error()}
@@ -597,36 +813,6 @@ func(db *BBoltDB)SaveUsersOnlineStatus(username string, isOnline bool) error {
     return nil
   })
 }
-
-// First, we check if Username is in /Users, if not found we then check in /DeactivateUser.
-// func(db *BBoltDB)DoesUsernameExist(userID UUID)( bool,error ){
-//   exists := false
-//   err := db.db.View(func(tx *bbolt.Tx) error {
-//
-//     // Bucket /Users
-//     bucket := tx.Bucket([]byte(USERS))
-//     if bucket == nil {
-//       log.Printf(" -> DoesUsernameExist: Failed to retreive Bucket \"%s\"", USERNAMES)
-//       return fmt.Errorf("Error: Could not retreive Bucket \"%s\"", USERNAMES)
-//     }
-//     if user := bucket.Get(userID[:]); user != nil {
-//       exists = true
-//     }
-//
-//     // Bucket /DeactivateUser
-//     bucket = tx.Bucket([]byte(DEACTIVATEDUSERS))
-//     if bucket == nil {
-//       log.Printf(" -> DoesUsernameExist: Failed to retreive Bucket \"%s\"", DEACTIVATEDUSERS)
-//       return fmt.Errorf("Error: Could not retreive Bucket \"%s\"", DEACTIVATEDUSERS)
-//     }
-//     if user := bucket.Get(userID[:]); user != nil {
-//       exists = true
-//     }
-//
-//     return nil
-//   })
-//   return exists, err
-// }
 
 // SaveUserToken :: Used for both creating and updating a UserToken within the
 //     /UserTokens Bucket.
