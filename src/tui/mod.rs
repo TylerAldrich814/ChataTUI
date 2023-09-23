@@ -1,15 +1,16 @@
-mod input;
+use crossterm::execute;
+use crate::tui::errors::TUIError;
+use crossterm::terminal::{self, disable_raw_mode, EnterAlternateScreen};
 mod errors;
-
+mod input;
 use itertools::Itertools;
 use log::error;
 use ratatui::{layout::Constraint::*, prelude::*, widgets::*};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Receiver;
-
+// use tokio::sync::mpsc::Receiver;
+use tokio::sync::broadcast::Receiver;
 pub use input::input_handler;
 pub use input::KeyboardInput;
-use crate::tui::errors::TUIError;
 
 #[derive(Clone, Debug)]
 pub enum UICommand {
@@ -27,8 +28,16 @@ impl UIHandler {
 		}
 	}
 	
-	pub async fn start(&mut self, ui_rx: Receiver<UICommand>){
+	/// CTUI's TUI application Loop: here is where both user input and incoming data
+	/// will be received, filtered/organized and finally painted to the screen(if needed)
+	pub async fn start(&self, mut ui_rx: Receiver<UICommand>) -> anyhow::Result<()> {
+		terminal::enable_raw_mode()?;
+		execute!(std::io::stdout(), EnterAlternateScreen)?;
 		
+		while let Ok(ui_command) = ui_rx.recv().await {
+		
+		}
+		Ok(())
 	}
 }
 

@@ -13,7 +13,8 @@
 // [x] /chatrooms/{room_id}/load      | GET
 // [x] /chatrooms/{room_id}/ws        | WS
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use anyhow::{Result, Error, anyhow};
 use chrono::{DateTime, Utc};
 use crate::{KeyboardInput, UICommand};
 use crate::api::errors::ChatroomError;
@@ -24,34 +25,18 @@ use reqwest;
 use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use std::sync::Arc;
+use futures_util::future::Join;
+use libc::initgroups;
 use super::endpoints;
 use tokio::sync::{mpsc, Mutex};
-use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::broadcast::Sender;
+// use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use uuid::{Uuid};
 
-// #[derive(Debug, Clone, Deserialize)]
-// pub struct ApiResponse<T> {
-//     data: Option<T>,
-//     error: Option<String>,
-// }
-// async fn handle_api_response<T: DeserializeOwned>(response: Response) -> Result<T, String> {
-//     match response.status() {
-//        StatusCode::OK => {
-//            let api_response: ApiResponse<T> = response.json().await.expect("");
-//            if let Some(data) = api_response.data {
-//                return Ok(data);
-//            }
-//            Err(api_response.error.unwrap_or_else(|| "Unknonwn Error".to_string()))
-//        },
-//        StatusCode::BAD_REQUEST => Err("Bad Request".to_string()),
-//        StatusCode::UNAUTHORIZED => Err("Unauthorized".to_string()),
-//        StatusCode::INTERNAL_SERVER_ERROR => Err("Internal Server Error".to_string()),
-//        status => Err(format!("REceived unexpected status code: {}", status))
-//     }
-// }
 #[derive(Debug, Clone, Deserialize)]
 struct APIErrorResponse {
     error: String,
@@ -106,11 +91,11 @@ pub struct Chatroom {
     owned_id: Uuid,
     public: bool
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct JoinChatroomHandle {
     room_name: String,
     user_name: String,
-    invitation: String,
+    invitation: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuthToken {
@@ -122,10 +107,17 @@ impl std::fmt::Display for AuthToken {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct WSArc{
-    pub handles: Arc<Mutex<Vec<JoinHandle<()>>>>
-}
+// #[derive(Debug, Default)]
+// pub struct WSArc{
+//     pub handles: Arc<Mutex<Vec<JoinHandle<()>>>>
+// }
+//
+// impl WSArc {
+//     pub fn clone(&self) -> Arc<Mutex<Vec<JoinHandle<()>>>> {
+//         self.handles.clone()
+//     }
+// }
+// pub type WSArc = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
 /// CTUIClient:: HTTP API Handler, for communicating with our Chatatui backend server.
 /// - client: A reqwest client that will for the lifetime of our Application.
@@ -134,13 +126,13 @@ pub struct WSArc{
 pub struct CTUIClient {
     client: reqwest::Client,
     auth_token: Option<AuthToken>,
-    ws_handles: WSArc,
+    ws_handles: Arc<Mutex<VecDeque<JoinHandle<()>>>>,
 }
 
 // -------------------------------------- ENDPOINTS ------------------------------------gg--
 
 impl CTUIClient {
-    pub fn new(handles: WSArc) -> CTUIClient {
+    pub fn new(handles: Arc<Mutex<VecDeque<JoinHandle<()>>>>) -> CTUIClient {
         CTUIClient {
             client: reqwest::Client::new(),
             auth_token: None,
@@ -151,12 +143,14 @@ impl CTUIClient {
     /// CTUIClient::Run -> When we receive data from input_rx. We match over the input. Specific
     ///     inputs will be mapped to specific HTTP API requests. Data may or may not be returned
     ///     from the API call. On Return, we take the data, and send it off to our UI via 'ui_tx
-    pub async fn run(&mut self, input_rx: Receiver<KeyboardInput>, ui_tx: Sender<UICommand>) {
-    
+    pub async fn start(&mut self, mut input_rx: Receiver<KeyboardInput>, ui_tx: Sender<UICommand>) {
+        while let Some(input) = input_rx.recv().await {
+        
+        }
     }
 
     /// HTTP Endpoints POST -> /Users/Signin
-    pub async fn sign_in(&mut self, username: &str, password: &str) -> Result<(), reqwest::Error> {
+    pub async fn sign_in(&mut self, username: &str, password: &str) -> Result<()> {
         let url = endpoints::post_sign_in_url();
         let parameters = [("username", username), ("password", password)];
 
@@ -172,7 +166,7 @@ impl CTUIClient {
     }
 
     /// HTTP Endpoints POST -> /Users/Signup
-    pub async fn sign_up(&mut self, username: &str, password: &str) -> Result<(), reqwest::Error> {
+    pub async fn sign_up(&mut self, username: &str, password: &str) -> Result<()> {
         let url = endpoints::post_sign_up_url();
         let parameters = [("username", username), ("password", password)];
 
@@ -189,12 +183,12 @@ impl CTUIClient {
 
     /// HTTP Endpoint POST -> /chatrooms
     /// Returns a StatusOK when successful. Maybe return an 'owners' token?
-    pub async fn create_chatroom(&self, chatroom: &Chatroom) -> Result<(), ChatroomError> {
+    pub async fn create_chatroom(&self, chatroom: &Chatroom) -> Result<()> {
         let token = match &self.auth_token {
             Some(token) => token,
             None => {
                 warn!(" -> chatroom_meta: auth_token is required.");
-                return Err(ChatroomError::Unauthorized)
+                return Err(anyhow!(ChatroomError::Unauthorized));
             }
         };
         let url = endpoints::get_chatrooms_url();
@@ -209,19 +203,19 @@ impl CTUIClient {
             if resp.status() == StatusCode::OK {
                 return Ok(())
             }
-            return Err(resp.status().into())
+            return Err(anyhow!("Response returned is not OK"))
         } else {
-            Err(ChatroomError::Unknown)
+            Err(anyhow!(ChatroomError::Unknown))
         }
     }
 
     /// HTTP Endpoint GET -> /chatrooms/{room_id}
-    pub async fn chatroom_meta(&self, room_name: &str) -> Result<Chatroom, ChatroomError> {
+    pub async fn chatroom_meta(&self, room_name: &str) -> Result<Chatroom> {
         let token = match &self.auth_token {
             Some(token) => token,
             None => {
                 warn!(" -> chatroom_meta: auth_token is required.");
-                return Err(ChatroomError::Unauthorized)
+                return Err(anyhow!(ChatroomError::Unauthorized))
             }
         };
         let url = endpoints::get_chatroom_by_id_url(room_name);
@@ -232,20 +226,23 @@ impl CTUIClient {
             .await
             .map_err(|_| ChatroomError::Unknown);
 
-        if response.status() != StatusCode::OK {
-            return Err(response.into());
+        if let Ok(resp) = response {
+            if resp.status() != StatusCode::OK {
+                return Err(anyhow!("Status returned is not OK"));
+            }
+            
+            return resp.json::<Chatroom>().await.map_err(|_| anyhow!(ChatroomError::Unknown));
         }
-
-        response.json::<Chatroom>().await.map_err(|_| ChatroomError::Unknown)
+        return Err(anyhow!(response.unwrap_err()));
     }
 
     /// HTTP Endpoint PUT -> /chatrooms/{room_id}
-    pub async fn update_chatroom(&self, chatroom: &Chatroom) -> Result<(), ChatroomError> {
+    pub async fn update_chatroom(&self, chatroom: &Chatroom) -> Result<()> {
         let token = match &self.auth_token {
             Some(token) => token,
             None => {
                 warn!(" -> chatroom_meta: auth_token is required.");
-                return Err(ChatroomError::Unauthorized)
+                return Err(anyhow!(ChatroomError::Unauthorized));
             }
         };
         let url = endpoints::get_chatroom_by_id_url(&chatroom.room_name);
@@ -257,18 +254,18 @@ impl CTUIClient {
             .await
             .map_err(|e| ChatroomError::Unknown)?;
         if response.status() != StatusCode::OK {
-            return Err(response.into());
+            return Err(anyhow!("Status returned is not OK"));
         }
         return Ok(())
     }
 
     /// HTTP Endpoint DELETE -> /chatrooms/{room_id}
-    pub async fn delete_chatroom(&self, room_name: &str) -> Result<(), ChatroomError> {
+    pub async fn delete_chatroom(&self, room_name: &str) -> Result<()> {
         let token = match &self.auth_token {
             Some(token) => token,
             None => {
                 warn!(" -> delete_chatroom: auth_token is required.");
-                return Err(ChatroomError::Unauthorized)
+                return Err(anyhow!(ChatroomError::Unauthorized));
             }
         };
 
@@ -280,7 +277,7 @@ impl CTUIClient {
             .map_err(|_| ChatroomError::Unknown)?;
 
         if resp.status() != StatusCode::OK {
-            return Err(resp.status().into());
+            return Err(anyhow!("Status returned is not OK"));
         }
         return Ok(())
     }
@@ -290,23 +287,23 @@ impl CTUIClient {
         &self,
         room_name: &str,
         user_name: &str,
-        invitation: Option<&str>,
-    ) -> Result<(), ChatroomError> {
+        invitation: Option<String>,
+    ) -> Result<()> {
         let token = match &self.auth_token {
             Some(token) => token,
             None => {
                 warn!(" -> join_chatroom: auth_token is required.");
-                return Err(ChatroomError::Unauthorized)
+                return Err(anyhow!(ChatroomError::Unauthorized));
             }
         };
         let url = endpoints::get_chatroom_join_url(room_name);
-
-        let handle = JoinChatroomHandle{
-            room_name: room_name.into(),
-            user_name: user_name.into(),
-            invitation: invitation.into(),
+        
+        let handle = JoinChatroomHandle {
+                room_name: room_name.into(),
+                user_name: user_name.into(),
+                invitation,
         };
-
+        
         let response = self.client.post(url)
             .bearer_auth(token)
             .json(&handle)
@@ -320,16 +317,16 @@ impl CTUIClient {
         // TODO: Handle this
         let error_resp: APIErrorResponse = response.json().await?;
         warn!(" -> join_chatroom: Error Occurred: {}", error_resp.error);
-        return Err(ChatroomError::Unknown);
+        return Err(anyhow!(ChatroomError::Unknown));
     }
 
-    /// HTTP Endpoint DELETE -> /chatrooms/{room_id}/load
-    pub async fn chatroom_onload(&self, room_name: &str) -> Result<Messages, ChatroomError> {
+    /// HTTP Endpoint GET -> /chatrooms/{room_id}/load
+    pub async fn chatroom_onload(&self, room_name: &str) -> Result<Messages> {
         let token = match &self.auth_token {
             Some(token) => token,
             None => {
                 warn!(" -> chatroom_onload: auth_token is required.");
-                return Err(ChatroomError::Unauthorized)
+                return Err(anyhow!(ChatroomError::Unauthorized));
             }
         };
         let url = endpoints::chatroom_on_load(room_name);
@@ -341,9 +338,10 @@ impl CTUIClient {
             .map_err(|_| ChatroomError::Unknown)?;
 
         if response.status().is_success() {
-            return response.json::<Messages>().await.map_err(|_| ChatroomError::Unknown);
+            return response.json::<Messages>().await.map_err(|_| anyhow!(ChatroomError::Unknown));
         }
-        return response.into();
+        // TODO: Be more concise with this error.
+        return Err(anyhow!("Failed to load Chatroom Data"));
     }
 
     /// HTTP Endpoint WS Update -> /chatrooms/{room_id}/ws
@@ -352,23 +350,24 @@ impl CTUIClient {
         room_id: &str,
         rx: Receiver<WSMessage>,
         tx: Sender<WSMessage>,
-    ){
+    ) -> Result<()>{
         let ws_url = endpoints::chatroom_ws_url(room_id);
         match connect_async(ws_url).await {
             Ok((ws_stream, _response)) => {
-                info!(" -> chatroom_ws: Successfully upgraded to Websocket!");
-                let (mut write_to_ws, mut read_from_ws) = ws_stream.split();
-                // let mut tx_clone = tx.clone();
+                info!(" -> chatroom_ws: Successfully upgraded to Websocket");
+                let (write_to_ws, read_from_ws) = ws_stream.split();
                 
                 // Create our asynchronous Tokio Spawns, and push them to WSHandles
-                let mut handles = self.ws_handles.handles.lock().await;
-                handles.push(receive_from_ws(read_from_ws, tx));
-                handles.push(send_to_ws(write_to_ws, rx));
+                let mut handles = self.ws_handles.lock().await;
+                handles.push_back(tokio::spawn(receive_from_ws(read_from_ws, tx)));
+                handles.push_back(tokio::spawn(send_to_ws(write_to_ws, rx)));
             }
             Err(e) => {
                 error!("chatroom_ws: Failed to Connect to Websocket: {}", e);
+                return Err(anyhow!(e));
             }
         }
+        Ok(())
     }
 }
 

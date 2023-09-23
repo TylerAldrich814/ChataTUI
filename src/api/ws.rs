@@ -1,10 +1,11 @@
 // ChataTUI's Frontend Websocket handler data structures and functions
 
 use std::borrow::Cow;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use futures_util::sink::SinkExt;
 use log::{error, warn};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -17,7 +18,7 @@ use crate::request_handlers::{APIMessage, Message};
 ///     UserMessage: For Taking user's messages and passing it through the WS
 ///     APIMessage:  For Any Automatic API Messages to the Backend(User status, errors, etc..)
 ///     Close: Websocket Frame for telling the Backend that we'll be closing the connection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum WSMessage {
     UserMessage(Box<Message>),
     APIStatus(Box<APIMessage>),
@@ -27,22 +28,22 @@ pub enum WSMessage {
 
 pub(crate) async fn receive_from_ws(
     mut ws_read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    mut tx: mpsc::Sender<WSMessage>,
+    mut tx: broadcast::Sender<WSMessage>,
 ){
     while let Some(Ok(ws_msg)) = ws_read.next().await {
         match ws_msg {
             TungsteniteMessage::Text(msg) => {
                 let wsmsg: Result<WSMessage, serde_json::Error> = serde_json::from_str(&msg);
                 if let Ok(msg) = wsmsg {
-                   if let Err(e) = tx.send(msg).await {
+                   if let Err(e) = tx.send(msg) {
                        warn!("receive_from_ws: Failed to send WSMessage from Websocket Message: {}", e);
                    }
+                }else {
+                    warn!(
+                        "Tungstenite Message was not Recognized: {:?}",
+                        wsmsg.unwrap_err(),
+                    );
                 }
-                warn!(
-                    "Tungstenite Message was not Recognized. UserMessage Error: {:?}, APIMessage Error: {:?}",
-                    msg_value.unwrap_err(),
-                    api_msg_value.unwrap_err()
-                );
             }
             TungsteniteMessage::Close(reason) => {
                 if let Some(close_frame) = reason {
@@ -51,7 +52,7 @@ pub(crate) async fn receive_from_ws(
                         close_frame.code, close_frame.reason
                     );
                 }
-                if let Err(e) = tx.send(WSMessage::Close).await {
+                if let Err(e) = tx.send(WSMessage::Close) {
                    error!("Failed to send Close Command after receiving close frame: {}", e);
                 }
                 break;
