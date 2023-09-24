@@ -28,6 +28,11 @@ pub async fn input_handler(
 		match event::read() {
 			Ok(event::Event::Key(KeyEvent { code, ..})) => {
 				match code {
+					KeyCode::Char('q') => {
+						println!("Shuting Down..");
+						let _ = shutdown.send(());
+						return;
+					}
 					KeyCode::Char(c) => {
 						if let Err(e) = tx.send(KeyboardInput::Input(c.into())).await {
 							error!("input_handler: Failed to Send Keyboard input: {}", e);

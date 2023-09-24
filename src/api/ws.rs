@@ -1,7 +1,8 @@
 // ChataTUI's Frontend Websocket handler data structures and functions
 
 use std::borrow::Cow;
-use tokio::sync::{broadcast, mpsc};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, Mutex};
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use futures_util::sink::SinkExt;
 use log::{error, warn};
@@ -28,16 +29,17 @@ pub enum WSMessage {
 
 pub(crate) async fn receive_from_ws(
     mut ws_read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    mut tx: broadcast::Sender<WSMessage>,
+    mut tx: Arc<Mutex<broadcast::Sender<WSMessage>>>,
 ){
     while let Some(Ok(ws_msg)) = ws_read.next().await {
+        let tx_clone = tx.clone();
         match ws_msg {
             TungsteniteMessage::Text(msg) => {
                 let wsmsg: Result<WSMessage, serde_json::Error> = serde_json::from_str(&msg);
                 if let Ok(msg) = wsmsg {
-                   if let Err(e) = tx.send(msg) {
+                    if let Err(e) = tx_clone.lock().await.send(msg) {
                        warn!("receive_from_ws: Failed to send WSMessage from Websocket Message: {}", e);
-                   }
+                    }
                 }else {
                     warn!(
                         "Tungstenite Message was not Recognized: {:?}",
@@ -52,7 +54,7 @@ pub(crate) async fn receive_from_ws(
                         close_frame.code, close_frame.reason
                     );
                 }
-                if let Err(e) = tx.send(WSMessage::Close) {
+                if let Err(e) = tx_clone.lock().await.send(WSMessage::Close) {
                    error!("Failed to send Close Command after receiving close frame: {}", e);
                 }
                 break;
@@ -61,6 +63,7 @@ pub(crate) async fn receive_from_ws(
                 warn!("Websocket Message kind not currently supported: {:?}", other_msg);
             }
         }
+        drop(tx_clone);
     }
 }
 
@@ -69,9 +72,9 @@ pub(crate) async fn receive_from_ws(
 /// Background API Related Messaging.
 pub(crate) async fn send_to_ws(
     mut ws_write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, TungsteniteMessage>,
-    mut rx: mpsc::Receiver<WSMessage>,
+    mut rx: Arc<Mutex<broadcast::Receiver<WSMessage>>>,
 ){
-    while let Some(message) = rx.recv().await {
+    while let Ok(message) = rx.clone().lock().await.recv().await {
         match message {
             WSMessage::UserMessage(msg) => {
                 match serde_json::to_string(&msg) {
@@ -101,7 +104,7 @@ pub(crate) async fn send_to_ws(
             },
             WSMessage::Error(msg) => {
                 error!("handle_ws_input: Websocket returned an Error: {}", msg);
-                todo!("You need to create the ")
+                todo!()
             }
             WSMessage::Close => {
                 let close_frame = CloseFrame {

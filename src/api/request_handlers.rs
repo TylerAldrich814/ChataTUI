@@ -13,29 +13,25 @@
 // [x] /chatrooms/{room_id}/load      | GET
 // [x] /chatrooms/{room_id}/ws        | WS
 
-use std::collections::VecDeque;
-use anyhow::{Result, Error, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use crate::{KeyboardInput, UICommand};
 use crate::api::errors::ChatroomError;
-use crate::api::ws::{receive_from_ws, send_to_ws, WSMessage};
-use futures_util::{sink::SinkExt, stream::StreamExt};
-use log::{error, info, trace, warn};
+use crate::api::ws::{receive_from_ws, send_to_ws};
+use futures_util::{sink::SinkExt, stream::StreamExt, TryFutureExt};
+use log::{error, info, warn};
 use reqwest;
 use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde::de::DeserializeOwned;
 use std::sync::Arc;
-use futures_util::future::Join;
-use libc::initgroups;
 use super::endpoints;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync:: Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::broadcast::Sender;
-// use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use uuid::{Uuid};
+use crate::api::chatroom_handler::ChatroomChannels;
 
 #[derive(Debug, Clone, Deserialize)]
 struct APIErrorResponse {
@@ -107,36 +103,24 @@ impl std::fmt::Display for AuthToken {
     }
 }
 
-// #[derive(Debug, Default)]
-// pub struct WSArc{
-//     pub handles: Arc<Mutex<Vec<JoinHandle<()>>>>
-// }
-//
-// impl WSArc {
-//     pub fn clone(&self) -> Arc<Mutex<Vec<JoinHandle<()>>>> {
-//         self.handles.clone()
-//     }
-// }
-// pub type WSArc = Arc<Mutex<Vec<JoinHandle<()>>>>;
-
 /// CTUIClient:: HTTP API Handler, for communicating with our Chatatui backend server.
 /// - client: A reqwest client that will for the lifetime of our Application.
 /// - auth_token: a JWT authorization token used for user authentication with All HTTP endpoints, expect Singup/Signin
-/// - ws_handles: An Arc<Mutex<JoinHandle>> copy from main. For Sharing Websocket recv, send joinhandles with the main app select loop.
+/// - chatroom_channels: Chatroom Websocket thread connection handlers. With ease of access via Chatroom room_id.
 pub struct CTUIClient {
     client: reqwest::Client,
     auth_token: Option<AuthToken>,
-    ws_handles: Arc<Mutex<VecDeque<JoinHandle<()>>>>,
+    chatroom_channels: Arc<Mutex<ChatroomChannels>>,
 }
 
 // -------------------------------------- ENDPOINTS ------------------------------------gg--
 
 impl CTUIClient {
-    pub fn new(handles: Arc<Mutex<VecDeque<JoinHandle<()>>>>) -> CTUIClient {
+    pub fn new(chatroom_channels: Arc<Mutex<ChatroomChannels>>) -> CTUIClient {
         CTUIClient {
             client: reqwest::Client::new(),
             auth_token: None,
-            ws_handles: handles,
+            chatroom_channels,
         }
     }
     
@@ -346,21 +330,31 @@ impl CTUIClient {
 
     /// HTTP Endpoint WS Update -> /chatrooms/{room_id}/ws
     pub async fn chatroom_ws(
-        &self,
+        &mut self,
         room_id: &str,
-        rx: Receiver<WSMessage>,
-        tx: Sender<WSMessage>,
     ) -> Result<()>{
         let ws_url = endpoints::chatroom_ws_url(room_id);
+        let mut locked_chatrooms = self.chatroom_channels.lock().await;
+        
+        let active_chatroom = locked_chatrooms.create_chatroom(room_id);
+        let tx = active_chatroom.sender.clone();
+        let rx = active_chatroom.receiver.clone();
+        
         match connect_async(ws_url).await {
             Ok((ws_stream, _response)) => {
                 info!(" -> chatroom_ws: Successfully upgraded to Websocket");
                 let (write_to_ws, read_from_ws) = ws_stream.split();
                 
                 // Create our asynchronous Tokio Spawns, and push them to WSHandles
-                let mut handles = self.ws_handles.lock().await;
-                handles.push_back(tokio::spawn(receive_from_ws(read_from_ws, tx)));
-                handles.push_back(tokio::spawn(send_to_ws(write_to_ws, rx)));
+                let mut channels = self.chatroom_channels.lock().await;
+                channels.spawn_and_store(
+                    room_id,
+                    tokio::spawn(receive_from_ws(read_from_ws, tx ))
+                );
+                channels.spawn_and_store(
+                    room_id,
+                    tokio::spawn(send_to_ws(write_to_ws, rx))
+                );
             }
             Err(e) => {
                 error!("chatroom_ws: Failed to Connect to Websocket: {}", e);
